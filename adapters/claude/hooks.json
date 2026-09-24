@@ -19,5 +19,15 @@
         }
       ]
     }
+  ],
+  "Stop": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "/usr/bin/python3 $HOME/.multi-agent-chat/skill/multi-agent-chat/scripts/chat.py hook claude stop"
+        }
+      ]
+    }
   ]
 }

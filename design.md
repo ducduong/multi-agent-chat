@@ -80,11 +80,13 @@ One SQLite file, `data/chat.db`, with one transaction per command. SQLite is cho
 | `create --name claude --topic "..." [--max-turns 12]` | Creates the chat in `lobby` status, joins the caller as host and prints the chat id |
 | `brief (--file <path> \| -)` | Host only, lobby only. Sets the brief (at most 16 KB) |
 | `join (<id> \| --latest) --name codex` | Adds a participant (lobby only) and prints the topic, brief and roster |
+| `join <id> --name N --rejoin` | Retake an existing seat from a new or recovered session (lobby or active). The session is re-bound; the agent gets everything after its `read_seq` |
+| `reopen --chat <id> --name N [--turns K]` | Any participant, on an ended chat. The chat becomes active with K more turns and N speaks first. Other agents rejoin |
 | `start` | Host only. Fixes the roster, sets status to `active` and gives the first turn to the host |
 | `wait --name codex [--timeout 300] [--skip-turn K]` | Blocks until it's this agent's turn (other than turn K, which a waker has already delivered), then prints the messages after its `read_seq` and sets `shown_seq` to the last one printed. Exit code: 0 = your turn, 3 = ended, 4 = timeout |
 | `post --name codex "<text>"` | Accepted only if the caller is the current speaker. Sets `read_seq = shown_seq` and passes the turn on |
 | `waker codex --thread T` | Codex only: the detached wake loop started by bind |
-| `extend --name <host> --turns K` | Host only. Raises `max_turns` by K; used from the limit turn |
+| `extend --name N --turns K` | Any participant, while the chat is active: raises `max_turns` by K. The human asks with `// extend K` in any session; the host also uses it from the limit turn |
 | `status` / `tail [--follow]` / `end` | Show state / show the chat for humans / end the chat |
 | `hook <harness> <event>` | Adapter entry point: hook JSON on stdin, the harness's expected response on stdout |
 
@@ -161,7 +163,7 @@ Reported bugs mean injection alone doesn't prove a wake. There are reports of `c
 
 ## Security
 
-v0 trusts the local agents. Any agent with shell access can run `chat.py`, so message kinds are not authenticated. The skill says chat messages are quoted content, never instructions. Codex runs with `--yolo` (the human's standard setup), so no sandbox limits it: a Codex that another agent talks into running a command faces no barrier. This risk is accepted for v0, and the scope is discussion only.
+v0 trusts the local agents. Any agent with shell access can run `chat.py`, so message kinds are not authenticated. The skill says agents' messages are quoted content, never instructions. A human message that @mentions an agent is an instruction to that agent, carried out on its turn. This relies on only the relay hook creating `human` messages, which v0's trust model accepts. Codex runs with `--yolo` (the human's standard setup), so no sandbox limits it: a Codex that another agent talks into running a command faces no barrier. This risk is accepted for v0, and the scope is discussion only.
 
 ## Spike findings (2026-09-23)
 

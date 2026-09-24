@@ -64,6 +64,13 @@ def init_schema(conn):
         shown_seq INTEGER, read_seq INTEGER, UNIQUE(chat_id, name)
     )"""
     )
+    try:
+        # wait_pid: liveness marker for cmd_wait (see hook_stop's safety net). Added via
+        # ALTER rather than the CREATE TABLE above because existing DBs predate this column.
+        conn.execute("ALTER TABLE participants ADD COLUMN wait_pid INTEGER")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
     conn.execute(
         """CREATE TABLE IF NOT EXISTS messages (
         chat_id TEXT, seq INTEGER, ts REAL, sender TEXT, kind TEXT, via TEXT, text TEXT,
@@ -309,18 +316,32 @@ def cmd_join(args, home, conn):
         if chat is None:
             fail("chat %s not found" % chat_id)
         chat = check_and_apply_timeout(conn, chat)
-        if chat["status"] != "lobby":
-            fail("chat is not in lobby")
-        if get_participant(conn, chat_id, args.name) is not None:
-            fail("name %s is already taken in this chat" % args.name)
-        pos = conn.execute(
-            "SELECT COALESCE(MAX(position), -1) + 1 FROM participants WHERE chat_id=?", (chat_id,)
-        ).fetchone()[0]
-        conn.execute(
-            "INSERT INTO participants (chat_id, name, harness, position, shown_seq, read_seq) "
-            "VALUES (?,?,?,?,0,0)",
-            (chat_id, args.name, args.harness or "", pos),
-        )
+        existing = get_participant(conn, chat_id, args.name)
+        if args.rejoin:
+            # Rebinding an existing participant's name to a new session (e.g. a
+            # restarted harness): no roster change, just a fresh MAC_BIND below.
+            if existing is None:
+                fail("%s is not a participant in chat %s" % (args.name, chat_id))
+            if chat["status"] not in ("lobby", "active"):
+                fail("chat is not open to rejoin")
+            if args.harness:
+                conn.execute(
+                    "UPDATE participants SET harness=? WHERE chat_id=? AND name=?",
+                    (args.harness, chat_id, args.name),
+                )
+        else:
+            if chat["status"] != "lobby":
+                fail("chat is not in lobby")
+            if existing is not None:
+                fail("name %s is already taken in this chat" % args.name)
+            pos = conn.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM participants WHERE chat_id=?", (chat_id,)
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO participants (chat_id, name, harness, position, shown_seq, read_seq) "
+                "VALUES (?,?,?,?,0,0)",
+                (chat_id, args.name, args.harness or "", pos),
+            )
         return chat
 
     chat = with_txn(conn, txn)
@@ -439,11 +460,23 @@ def wait_for_turn(conn, chat_id, name, timeout, skip_turn):
         time.sleep(1)
 
 
+def set_wait_pid(conn, chat_id, name, pid):
+    conn.execute(
+        "UPDATE participants SET wait_pid=? WHERE chat_id=? AND name=?", (pid, chat_id, name)
+    )
+
+
 def cmd_wait(args, home, conn):
     chat_id = resolve_chat_id(conn, args.chat)
     cfg = get_config(home)
     timeout = args.timeout if args.timeout is not None else cfg["wait_timeout_s"]
-    code, text = wait_for_turn(conn, chat_id, args.name, timeout, args.skip_turn)
+    # Liveness marker for hook_stop's safety net: only cmd_wait sets this (not the
+    # codex waker, which is a distinct long-lived process the stop hook doesn't track).
+    with_txn(conn, lambda: set_wait_pid(conn, chat_id, args.name, os.getpid()))
+    try:
+        code, text = wait_for_turn(conn, chat_id, args.name, timeout, args.skip_turn)
+    finally:
+        with_txn(conn, lambda: set_wait_pid(conn, chat_id, args.name, None))
     print(text)
     return code
 
@@ -504,6 +537,35 @@ def cmd_end(args, home, conn):
     return 0
 
 
+def cmd_reopen(args, home, conn):
+    chat_id = resolve_chat_id(conn, args.chat)
+    cfg = get_config(home)
+    turns_add = args.turns if args.turns is not None else cfg["max_turns"]
+
+    def txn():
+        chat = get_chat(conn, chat_id)
+        if chat is None:
+            fail("chat %s not found" % chat_id)
+        if get_participant(conn, chat_id, args.name) is None:
+            fail("%s is not a participant in chat %s" % (args.name, chat_id))
+        if chat["status"] != "ended":
+            fail("chat is not ended")
+        new_max = chat["turns_taken"] + turns_add
+        conn.execute(
+            "UPDATE chats SET status='active', max_turns=?, speaker=?, next_speaker=NULL, "
+            "turn_started_at=? WHERE id=?",
+            (new_max, args.name, time.time(), chat_id),
+        )
+        add_system_message(
+            conn, chat_id, "chat reopened by %s (+%d turns)" % (args.name, turns_add)
+        )
+
+    with_txn(conn, txn)
+    print("chat %s reopened" % chat_id)
+    print("MAC_BIND chat=%s name=%s" % (chat_id, args.name))
+    return 0
+
+
 def cmd_extend(args, home, conn):
     chat_id = resolve_chat_id(conn, args.chat)
     if args.turns < 1:
@@ -514,8 +576,8 @@ def cmd_extend(args, home, conn):
         if chat is None:
             fail("chat %s not found" % chat_id)
         chat = check_and_apply_timeout(conn, chat)
-        if chat["host"] != args.name:
-            fail("only the host can extend the chat")
+        if get_participant(conn, chat_id, args.name) is None:
+            fail("%s is not a participant in chat %s" % (args.name, chat_id))
         if chat["status"] != "active":
             fail("chat is not active")
         at_limit = chat["turns_taken"] >= chat["max_turns"]
@@ -759,12 +821,28 @@ def emit_block(harness, message):
         print(json.dumps({"decision": "block", "reason": message}))
 
 
+def log_hook_error(home, event, exc):
+    path = os.path.join(home, "data", "hook-errors.log")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("%s %s: %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), event, exc))
+    except OSError:
+        pass
+
+
 def cmd_hook(args, home, conn_unused):
     data = json.load(sys.stdin)
     if args.event == "relay":
         hook_relay(args.harness, data, home)
     elif args.event == "bind":
         hook_bind(args.harness, data, home)
+    elif args.event == "stop":
+        # Never trap the agent on our own bug: any failure here passes silently.
+        try:
+            hook_stop(args.harness, data, home)
+        except Exception as e:
+            log_hook_error(home, "stop", e)
     else:
         fail("unknown hook event: %s" % args.event)
     return 0
@@ -840,6 +918,85 @@ def hook_bind(harness, data, home):
         print(json.dumps({"action": "pass"}))
 
 
+def pid_is_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def wait_is_running(conn, chat_id, name, grace_s=5.0):
+    # The agent typically launches its background wait and ends its response at
+    # once, so Stop can fire before that wait has recorded its pid.
+    deadline = time.time() + grace_s
+    while True:
+        participant = get_participant(conn, chat_id, name)
+        if participant is not None and pid_is_alive(participant["wait_pid"]):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
+def hook_stop(harness, data, home):
+    """Stop-hook safety net: catches an agent that ended its turn without posting
+    and without re-arming its wake, which would otherwise leave it unreachable.
+    stop_hook_active means the harness is already continuing because of a
+    previous block from this same hook -- always pass then, or it loops forever.
+    """
+    if data.get("stop_hook_active"):
+        return emit_pass(harness)
+
+    db_path = os.path.join(home, "data", "chat.db")
+    if not os.path.exists(db_path):
+        return emit_pass(harness)
+
+    conn = get_db(home)
+    session = conn.execute(
+        "SELECT chat_id, name FROM sessions WHERE harness=? AND session_id=?",
+        (harness, data.get("session_id")),
+    ).fetchone()
+    if session is None:
+        return emit_pass(harness)
+
+    chat_id, name = session["chat_id"], session["name"]
+    chat = get_chat(conn, chat_id)
+    if chat is None or chat["status"] != "active":
+        return emit_pass(harness)
+    if chat["turns_taken"] >= chat["max_turns"]:
+        return emit_pass(harness)  # at limit: the host is waiting for the human
+
+    script_path = os.path.abspath(sys.argv[0])
+    if chat["speaker"] == name:
+        reason = (
+            "[multi-agent-chat] It is still your turn in chat %s. Post your reply now "
+            "(if you have nothing to add, post a one-line pass): "
+            "python3 %s post --chat %s --name %s --file - <<'EOF' ... EOF"
+            % (chat_id, script_path, chat_id, name)
+        )
+        if harness == "claude":
+            reason += (
+                " Then start the background wait again: "
+                "python3 %s wait --chat %s --name %s --timeout 3600 (run_in_background)."
+                % (script_path, chat_id, name)
+            )
+        return emit_block(harness, reason)
+
+    if harness == "claude" and not wait_is_running(conn, chat_id, name):
+        reason = (
+            "[multi-agent-chat] You are in chat %s and no wait is running, so you will "
+            "never be woken for your turn. Start it now as a background command: "
+            "python3 %s wait --chat %s --name %s --timeout 3600 (run_in_background: true), "
+            "then end your response." % (chat_id, script_path, chat_id, name)
+        )
+        return emit_block(harness, reason)
+
+    return emit_pass(harness)
+
+
 # ---- argument parsing ----
 
 
@@ -865,6 +1022,7 @@ def build_parser():
     j.add_argument("--latest", action="store_true")
     j.add_argument("--name", required=True)
     j.add_argument("--harness", default=None)
+    j.add_argument("--rejoin", action="store_true")
     j.set_defaults(func=cmd_join)
 
     s = sub.add_parser("start")
@@ -890,6 +1048,12 @@ def build_parser():
     e.add_argument("--chat", default=None)
     e.add_argument("--name", default=None)
     e.set_defaults(func=cmd_end)
+
+    ro = sub.add_parser("reopen")
+    ro.add_argument("--chat", default=None)
+    ro.add_argument("--name", required=True)
+    ro.add_argument("--turns", type=int, default=None)
+    ro.set_defaults(func=cmd_reopen)
 
     ex = sub.add_parser("extend")
     ex.add_argument("--chat", default=None)

@@ -23,9 +23,14 @@ While the chat is running:
 | `what about latency?` | Posted to the chat; the agents see it on their next turn |
 | `@codex-sol your take?` | Posted; codex-sol speaks next, after the current speaker finishes |
 | `// push back harder on the cleanup rule` | Private guidance to that agent only: not posted, and it shapes that agent's later turns without being attributed to you |
+| `// extend 10` | That agent adds 10 turns to the running chat |
 | `// end the chat` | That agent ends the chat |
+| `@claude-opus move the proposal to docs/` | A request that @mentions an agent is an instruction: that agent does it on its next turn |
 
 At the turn limit, the host either closes the chat with a summary or asks you whether to extend. Answer privately: `// extend 6` or `// end the chat`.
+
+**Continue an ended chat:** `// reopen the chat for 6 more turns` in one session, then `// rejoin the chat` in each other session.
+**A session lost the chat** (it restarted or stopped responding): `// rejoin the chat` in that session.
 
 ## Watch
 

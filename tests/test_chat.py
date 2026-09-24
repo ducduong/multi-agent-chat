@@ -67,10 +67,17 @@ class ChatTestCase(unittest.TestCase):
         r = self.run_cmd(args, check=True)
         return r.stdout.splitlines()[0]
 
-    def join(self, chat_id, name, harness=None, check=True):
-        args = ["join", chat_id, "--name", name]
+    def join(self, chat_id, name, harness=None, check=True, rejoin=False, latest=False):
+        args = ["join"]
+        if not latest:
+            args.append(chat_id)
+        args += ["--name", name]
         if harness:
             args += ["--harness", harness]
+        if rejoin:
+            args.append("--rejoin")
+        if latest:
+            args.append("--latest")
         return self.run_cmd(args, check=check)
 
     def start(self, chat_id, name, check=True):
@@ -93,6 +100,37 @@ class ChatTestCase(unittest.TestCase):
     def relay(self, harness, session_id, prompt):
         payload = json.dumps({"session_id": session_id, "prompt": prompt})
         return self.run_cmd(["hook", harness, "relay"], input_text=payload)
+
+    def bind_direct(self, harness, session_id, chat_id, name):
+        """Insert a sessions row without going through hook_bind, so tests that only
+        need a bound session don't trigger hook_bind's codex-waker side effect."""
+        conn = sqlite3.connect(self.db_path())
+        conn.execute(
+            "INSERT INTO sessions (harness, session_id, chat_id, name) VALUES (?,?,?,?) "
+            "ON CONFLICT(harness, session_id) DO UPDATE SET chat_id=excluded.chat_id, "
+            "name=excluded.name",
+            (harness, session_id, chat_id, name),
+        )
+        conn.commit()
+        conn.close()
+
+    def stop_hook(self, harness, session_id, stop_hook_active=False):
+        payload = json.dumps({"session_id": session_id, "stop_hook_active": stop_hook_active})
+        return self.run_cmd(["hook", harness, "stop"], input_text=payload)
+
+    def set_wait_pid(self, chat_id, name, pid):
+        conn = sqlite3.connect(self.db_path())
+        conn.execute(
+            "UPDATE participants SET wait_pid=? WHERE chat_id=? AND name=?", (pid, chat_id, name)
+        )
+        conn.commit()
+        conn.close()
+
+    def reopen(self, chat_id, name, turns=None, check=True):
+        args = ["reopen", "--chat", chat_id, "--name", name]
+        if turns is not None:
+            args += ["--turns", str(turns)]
+        return self.run_cmd(args, check=check)
 
     def setup_three_way_chat(self, max_turns=12):
         chat_id = self.create_chat(name="claude", topic="t", max_turns=max_turns)
@@ -264,15 +302,35 @@ class TestTurnLimit(ChatTestCase):
 
 
 class TestExtend(ChatTestCase):
-    def test_non_host_extend_rejected(self):
+    def test_non_participant_extend_rejected(self):
         chat_id = self.setup_three_way_chat(max_turns=2)
-        r = self.run_cmd(["extend", "--chat", chat_id, "--name", "codex", "--turns", "3"])
+        r = self.run_cmd(["extend", "--chat", chat_id, "--name", "nobody", "--turns", "3"])
         self.assertNotEqual(r.returncode, 0)
 
     def test_extend_requires_positive_turns(self):
         chat_id = self.setup_three_way_chat(max_turns=2)
         r = self.run_cmd(["extend", "--chat", chat_id, "--name", "claude", "--turns", "0"])
         self.assertNotEqual(r.returncode, 0)
+
+    def test_non_host_participant_extend_mid_chat_leaves_speaker_and_clock_unchanged(self):
+        chat_id = self.setup_three_way_chat(max_turns=12)  # not at limit; speaker=claude (host)
+        before = self.query(
+            "SELECT speaker, turn_started_at, max_turns FROM chats WHERE id=?", (chat_id,)
+        )[0]
+
+        r = self.run_cmd(
+            ["extend", "--chat", chat_id, "--name", "codex", "--turns", "3"], check=True
+        )
+        self.assertIn("extended", r.stdout)
+
+        after = self.query(
+            "SELECT speaker, turn_started_at, max_turns FROM chats WHERE id=?", (chat_id,)
+        )[0]
+        self.assertEqual(after[0], before[0])
+        self.assertEqual(after[1], before[1])
+        self.assertEqual(after[2], before[2] + 3)
+        tail = self.run_cmd(["tail", "--chat", chat_id], check=True)
+        self.assertIn("codex extended the chat by 3 turns (now %d)" % after[2], tail.stdout)
 
     def test_host_extend_at_limit_then_post_advances_rotation(self):
         chat_id = self.setup_three_way_chat(max_turns=2)
@@ -634,6 +692,293 @@ class TestSkipTurn(ChatTestCase):
         self.assertEqual(r.returncode, 3)
 
 
+class TestWaitPid(ChatTestCase):
+    def test_wait_sets_wait_pid_while_blocked_and_clears_after(self):
+        chat_id = self.setup_three_way_chat()  # speaker is claude; codex's wait blocks
+        proc = subprocess.Popen(
+            [PY, SCRIPT, "wait", "--chat", chat_id, "--name", "codex", "--timeout", "5"],
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            deadline = time.time() + 3
+            pid = None
+            while time.time() < deadline:
+                rows = self.query(
+                    "SELECT wait_pid FROM participants WHERE chat_id=? AND name='codex'", (chat_id,)
+                )
+                if rows and rows[0][0] is not None:
+                    pid = rows[0][0]
+                    break
+                time.sleep(0.1)
+            self.assertEqual(pid, proc.pid)
+        finally:
+            proc.wait(timeout=10)
+            proc.stdout.close()
+            proc.stderr.close()
+
+        rows = self.query(
+            "SELECT wait_pid FROM participants WHERE chat_id=? AND name='codex'", (chat_id,)
+        )
+        self.assertIsNone(rows[0][0])
+
+    def test_migration_adds_wait_pid_to_a_db_created_without_it(self):
+        chat_id = self.create_chat(name="claude", topic="t")
+        # simulate a pre-migration DB by rebuilding participants without wait_pid
+        conn = sqlite3.connect(self.db_path())
+        conn.execute("ALTER TABLE participants RENAME TO participants_old")
+        conn.execute(
+            "CREATE TABLE participants (chat_id TEXT, name TEXT, harness TEXT, position INTEGER, "
+            "shown_seq INTEGER, read_seq INTEGER, UNIQUE(chat_id, name))"
+        )
+        conn.execute(
+            "INSERT INTO participants (chat_id, name, harness, position, shown_seq, read_seq) "
+            "SELECT chat_id, name, harness, position, shown_seq, read_seq FROM participants_old"
+        )
+        conn.execute("DROP TABLE participants_old")
+        conn.commit()
+        conn.close()
+
+        r = self.run_cmd(["status", "--chat", chat_id], check=True)
+        self.assertIn("status: lobby", r.stdout)
+        cols = [row[1] for row in self.query("PRAGMA table_info(participants)")]
+        self.assertIn("wait_pid", cols)
+
+
+class TestStopHook(ChatTestCase):
+    def test_stop_hook_active_always_passes(self):
+        chat_id = self.setup_three_way_chat()
+        self.bind("claude", "s1", chat_id, "claude")
+        r = self.stop_hook("claude", "s1", stop_hook_active=True)
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+
+    def test_unbound_session_passes(self):
+        r = self.stop_hook("claude", "never-bound")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+
+    def test_lobby_chat_passes(self):
+        chat_id = self.create_chat(name="claude", topic="t")
+        self.bind("claude", "s1", chat_id, "claude")
+        r = self.stop_hook("claude", "s1")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+
+    def test_at_limit_passes(self):
+        chat_id = self.setup_three_way_chat(max_turns=2)
+        self.post(chat_id, "claude", "a")
+        self.post(chat_id, "codex", "b")  # at limit; speaker becomes claude (host)
+        self.bind("claude", "s1", chat_id, "claude")
+        r = self.stop_hook("claude", "s1")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+
+    def test_speaker_is_me_blocks_and_claude_mentions_wait(self):
+        chat_id = self.setup_three_way_chat()  # speaker is claude
+        self.bind("claude", "s1", chat_id, "claude")
+        r = self.stop_hook("claude", "s1")
+        data = json.loads(r.stdout)
+        self.assertEqual(data["decision"], "block")
+        self.assertIn("still your turn", data["reason"])
+        self.assertIn("wait", data["reason"])
+
+    def test_speaker_is_me_blocks_and_codex_does_not_mention_wait(self):
+        chat_id = self.create_chat(name="codex", topic="t")
+        self.join(chat_id, "claude")
+        self.start(chat_id, "codex")  # speaker is codex
+        self.bind_direct("codex", "s1", chat_id, "codex")
+        r = self.stop_hook("codex", "s1")
+        data = json.loads(r.stdout)
+        self.assertEqual(data["decision"], "block")
+        self.assertIn("still your turn", data["reason"])
+        self.assertNotIn("background wait", data["reason"])
+
+    def test_claude_not_speaker_and_no_live_wait_blocks(self):
+        chat_id = self.setup_three_way_chat()  # speaker is claude
+        self.bind("claude", "s1", chat_id, "codex")  # bound to a participant not currently speaking
+        r = self.stop_hook("claude", "s1")
+        data = json.loads(r.stdout)
+        self.assertEqual(data["decision"], "block")
+        self.assertIn("no wait is running", data["reason"])
+
+    def test_claude_not_speaker_with_live_wait_passes(self):
+        chat_id = self.setup_three_way_chat()  # speaker is claude
+        self.bind("claude", "s1", chat_id, "codex")
+        helper = subprocess.Popen([PY, "-c", "import time; time.sleep(5)"])
+        try:
+            self.set_wait_pid(chat_id, "codex", helper.pid)
+            r = self.stop_hook("claude", "s1")
+            self.assertEqual(r.returncode, 0)
+            self.assertEqual(r.stdout, "")
+        finally:
+            helper.terminate()
+            helper.wait(timeout=5)
+
+    def test_claude_wait_registering_shortly_after_stop_passes(self):
+        chat_id = self.setup_three_way_chat()  # speaker is claude
+        self.bind("claude", "s1", chat_id, "codex")
+        helper = subprocess.Popen([PY, "-c", "import time; time.sleep(10)"])
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(self.stop_hook, "claude", "s1")
+                time.sleep(2)
+                self.set_wait_pid(chat_id, "codex", helper.pid)
+                r = fut.result(timeout=15)
+            self.assertEqual(r.stdout, "")
+        finally:
+            helper.terminate()
+            helper.wait(timeout=5)
+
+    def test_codex_not_speaker_passes_regardless_of_wait_pid(self):
+        chat_id = self.setup_three_way_chat()  # speaker is claude
+        self.bind_direct("codex", "s1", chat_id, "opencode")  # not speaker, no wait_pid at all
+        r = self.stop_hook("codex", "s1")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+
+
+class TestRejoin(ChatTestCase):
+    def test_rejoin_unknown_name_rejected(self):
+        chat_id = self.setup_three_way_chat()
+        r = self.join(chat_id, "someone-else", rejoin=True, check=False)
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_plain_join_of_taken_name_still_rejected(self):
+        chat_id = self.setup_three_way_chat()
+        r = self.join(chat_id, "codex", check=False)
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_rejoin_rebinds_session_and_delivers_since_read_seq(self):
+        # bind_direct, not bind: only the session/participant bookkeeping is under
+        # test here, not hook_bind's codex-waker spawn (covered by TestReopenCodexWaker).
+        chat_id = self.setup_three_way_chat(max_turns=12)
+        self.bind_direct("codex", "sess-old", chat_id, "codex")
+
+        r = self.join(chat_id, "codex", rejoin=True, check=True)
+        self.assertIn("MAC_BIND chat=%s name=codex" % chat_id, r.stdout)
+        self.assertIn("roster: claude, codex, opencode", r.stdout)
+
+        self.bind_direct("codex", "sess-new", chat_id, "codex")
+        rows = self.query(
+            "SELECT chat_id, name FROM sessions WHERE harness='codex' AND session_id='sess-new'"
+        )
+        self.assertEqual(rows, [(chat_id, "codex")])
+
+        self.post(chat_id, "claude", "a")  # codex's turn now
+        r = self.relay("codex", "sess-new", "note for codex")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("posted", json.loads(r.stdout)["reason"])
+
+        w = self.wait(chat_id, "codex", timeout=2)
+        self.assertEqual(w.returncode, 0)
+        self.assertIn("note for codex", w.stdout)
+
+    def test_rejoin_allowed_while_lobby(self):
+        chat_id = self.create_chat(name="claude", topic="t")
+        self.join(chat_id, "codex")
+        r = self.join(chat_id, "codex", rejoin=True, check=False)
+        self.assertEqual(r.returncode, 0)
+
+    def test_rejoin_rejected_when_ended(self):
+        chat_id = self.setup_three_way_chat()
+        self.run_cmd(["end", "--chat", chat_id, "--name", "claude"], check=True)
+        r = self.join(chat_id, "codex", rejoin=True, check=False)
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_rejoin_latest_ignores_status(self):
+        chat_id = self.setup_three_way_chat()
+        self.run_cmd(["end", "--chat", chat_id, "--name", "claude"], check=True)
+        r = self.join(None, "codex", rejoin=True, latest=True, check=False)
+        # --latest resolved to this (ended) chat rather than failing to find one;
+        # rejoin is then rejected because the chat itself is not open to rejoin.
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("chat is not open to rejoin", r.stderr)
+
+
+class TestReopen(ChatTestCase):
+    def ended_chat(self, max_turns=2):
+        chat_id = self.setup_three_way_chat(max_turns=max_turns)
+        self.post(chat_id, "claude", "a")
+        self.post(chat_id, "codex", "b")  # at limit; speaker=claude (host)
+        self.post(chat_id, "claude", "closing summary")  # ends the chat
+        return chat_id
+
+    def test_reopen_on_active_chat_rejected(self):
+        chat_id = self.setup_three_way_chat()
+        r = self.reopen(chat_id, "claude", check=False)
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_reopen_by_non_participant_rejected(self):
+        chat_id = self.ended_chat()
+        r = self.reopen(chat_id, "nobody", check=False)
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_reopen_sets_speaker_and_max_turns_then_rotation_continues(self):
+        chat_id = self.ended_chat(max_turns=2)  # turns_taken == 2
+        r = self.reopen(chat_id, "codex", turns=3, check=True)
+        self.assertIn("reopened", r.stdout)
+        self.assertIn("MAC_BIND chat=%s name=codex" % chat_id, r.stdout)
+
+        st = self.run_cmd(["status", "--chat", chat_id], check=True)
+        self.assertIn("status: active", st.stdout)
+        self.assertIn("speaker: codex", st.stdout)
+        self.assertIn("turns: 2/5", st.stdout)
+        tail = self.run_cmd(["tail", "--chat", chat_id], check=True)
+        self.assertIn("chat reopened by codex (+3 turns)", tail.stdout)
+
+        # another agent's wait blocks until the reopener posts
+        r = self.wait(chat_id, "opencode", timeout=1)
+        self.assertEqual(r.returncode, 4)
+
+        r = self.post(chat_id, "codex", "continuing")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("next: opencode", r.stdout)  # rotation resumes after the reopener
+
+    def test_reopen_default_turns_uses_config_max_turns(self):
+        self.write_config(max_turns=7, turn_timeout_s=600, wait_timeout_s=300)
+        chat_id = self.ended_chat(max_turns=2)
+        self.reopen(chat_id, "claude", check=True)
+        st = self.run_cmd(["status", "--chat", chat_id], check=True)
+        self.assertIn("turns: 2/9", st.stdout)
+
+
+class TestReopenCodexWaker(ChatTestCase):
+    def setUp(self):
+        super().setUp()
+        self.codex_log = os.path.join(self.home, "fake-codex.log")
+        self.codex_bin = os.path.join(self.home, "fake-codex.sh")
+        with open(self.codex_bin, "w") as f:
+            f.write('#!/bin/sh\necho "$@" >> "%s"\nexit 0\n' % self.codex_log)
+        os.chmod(self.codex_bin, 0o755)
+        self.env["MAC_CODEX_BIN"] = self.codex_bin
+
+    def wait_until(self, predicate, timeout, message):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return
+            time.sleep(0.1)
+        self.fail(message)
+
+    def test_codex_bind_after_reopen_spawns_a_waker(self):
+        chat_id = self.create_chat(name="codex", topic="t", max_turns=2)
+        self.join(chat_id, "claude")
+        self.start(chat_id, "codex")
+        self.post(chat_id, "codex", "a")
+        self.post(chat_id, "claude", "b")  # at limit; speaker=codex (host)
+        self.post(chat_id, "codex", "closing summary")  # ends the chat
+
+        pidfile = os.path.join(self.home, "data", "wakers", "%s-codex.pid" % chat_id)
+        self.assertFalse(os.path.exists(pidfile))  # never bound while active, so never spawned
+
+        self.reopen(chat_id, "codex", check=True)
+        self.bind("codex", "codex-sess-reopen", chat_id, "codex")
+        self.wait_until(lambda: os.path.exists(pidfile), 5, "waker did not spawn after reopen")
+
+        self.run_cmd(["end", "--chat", chat_id, "--name", "codex"], check=True)
+        self.wait_until(lambda: not os.path.exists(pidfile), 8, "waker did not exit after chat ended")
+
+
 class TestWrappingQuotes(ChatTestCase):
     def test_wrapping_quotes_stripped_before_posting(self):
         chat_id = self.setup_three_way_chat()
@@ -782,7 +1127,10 @@ class TestInstall(unittest.TestCase):
             "hooks": {
                 "UserPromptSubmit": [
                     {"hooks": [{"type": "command", "command": "/bin/echo unrelated"}]}
-                ]
+                ],
+                "Stop": [
+                    {"hooks": [{"type": "command", "command": "/bin/echo existing-stop"}]}
+                ],
             },
         }
         codex_hooks = {
@@ -791,6 +1139,9 @@ class TestInstall(unittest.TestCase):
                 "SessionStart": [{"hooks": [{"type": "command", "command": "/bin/echo session-start"}]}],
                 "PostToolUse": [
                     {"matcher": "Bash", "hooks": [{"type": "command", "command": "/bin/echo audor-hook"}]}
+                ],
+                "Stop": [
+                    {"hooks": [{"type": "command", "command": "/bin/echo existing-codex-stop"}]}
                 ],
             },
         }
@@ -835,6 +1186,9 @@ class TestInstall(unittest.TestCase):
         self.assertEqual(self.count_mac_groups(ups), 1)
         self.assertTrue(any("unrelated" in h["command"] for g in ups for h in g["hooks"]))
         self.assertEqual(self.count_mac_groups(claude["hooks"]["PostToolUse"]), 1)
+        claude_stop = claude["hooks"]["Stop"]
+        self.assertEqual(self.count_mac_groups(claude_stop), 1)
+        self.assertTrue(any("existing-stop" in h["command"] for g in claude_stop for h in g["hooks"]))
 
         codex = self.load(".codex", "hooks.json")
         self.assertEqual(codex["description"], "codex hooks")
@@ -848,6 +1202,11 @@ class TestInstall(unittest.TestCase):
             any("audor-hook" in h["command"] for g in codex["hooks"]["PostToolUse"] for h in g["hooks"])
         )
         self.assertEqual(self.count_mac_groups(codex["hooks"]["UserPromptSubmit"]), 1)
+        codex_stop = codex["hooks"]["Stop"]
+        self.assertEqual(self.count_mac_groups(codex_stop), 1)
+        self.assertTrue(
+            any("existing-codex-stop" in h["command"] for g in codex_stop for h in g["hooks"])
+        )
 
         for link in self.symlink_paths():
             self.assertTrue(os.path.islink(link), link)
