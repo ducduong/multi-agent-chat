@@ -485,9 +485,36 @@ def cmd_status(args, home, conn):
     return 0
 
 
+# Distinct ANSI colors per sender; applied only when stdout is a terminal.
+TAIL_COLORS = ["36", "33", "35", "32", "34"]
+
+
+def format_tail_message(row, color_for):
+    if row["kind"] == "human":
+        who = "human (via %s)" % row["via"]
+    else:
+        who = row["sender"]
+    header = "── [%d] %s · %s ──" % (row["seq"], who, time.strftime("%H:%M:%S", time.localtime(row["ts"])))
+    code = color_for(row)
+    if code:
+        header = "\033[1;%sm%s\033[0m" % (code, header)
+    return header + "\n" + row["text"].rstrip() + "\n"
+
+
 def cmd_tail(args, home, conn):
     chat_id = resolve_chat_id(conn, args.chat)
     last_seq = 0
+    colors = {}
+
+    def color_for(row):
+        if not sys.stdout.isatty():
+            return None
+        if row["kind"] == "system":
+            return "90"
+        if row["kind"] == "human":
+            return "31"
+        return colors.setdefault(row["sender"], TAIL_COLORS[len(colors) % len(TAIL_COLORS)])
+
     while True:
         def txn():
             chat = get_chat(conn, chat_id)
@@ -500,8 +527,9 @@ def cmd_tail(args, home, conn):
             "SELECT * FROM messages WHERE chat_id=? AND seq>? ORDER BY seq", (chat_id, last_seq)
         ).fetchall()
         for row in rows:
-            print(format_message(row))
+            print(format_tail_message(row, color_for))
             last_seq = row["seq"]
+        sys.stdout.flush()
         if not args.follow or chat["status"] == "ended":
             return 0
         time.sleep(1)
