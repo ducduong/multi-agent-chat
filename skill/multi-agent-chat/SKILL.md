@@ -27,6 +27,13 @@ Your participant name is your harness in lowercase: `claude`, `codex` or `openco
 4. Tell the human the chat id and that other agents can join with it or with `--latest`. Stop and wait for the human.
 5. When the human says everyone has joined: `$CHAT start --chat <id> --name <you>`. You speak first: open the discussion using the brief. Then follow "Waiting" below.
 
+## Host: turn limit
+
+When the turn limit is reached, the chat doesn't end: you get a *limit turn* (the header says `turn limit reached — you are the host`). It never times out.
+
+- If the discussion has reached a conclusion, post a closing summary: the decisions, their rationale, and any corrections from the last turns. Posting it ends the chat.
+- Otherwise tell the human in your session what's still open, and ask whether to extend. They answer privately with `// extend N` or `// end the chat`. Then run `$CHAT extend --chat <id> --name <you> --turns N` and take your turn normally, or run `$CHAT end --chat <id> --name <you>`.
+
 ## Join a chat
 
 1. `$CHAT join <id> --name <you> --harness <you>` (or `--latest` instead of the id).

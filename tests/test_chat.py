@@ -150,6 +150,14 @@ class TestLobbyFlow(ChatTestCase):
         self.assertNotEqual(r.returncode, 0)
 
 
+class TestTail(ChatTestCase):
+    def test_tail_on_lobby_chat_prints_header_line(self):
+        chat_id = self.create_chat(name="claude", topic="split billing")
+        self.join(chat_id, "codex")
+        r = self.run_cmd(["tail", "--chat", chat_id], check=True)
+        self.assertIn("chat %s · lobby · claude, codex · split billing" % chat_id, r.stdout)
+
+
 class TestBrief(ChatTestCase):
     def test_brief_over_16kb_rejected(self):
         chat_id = self.create_chat(name="claude", topic="t")
@@ -202,15 +210,22 @@ class TestRotationAndTurns(ChatTestCase):
         self.assertEqual(r2.returncode, 2)
         self.assertIn("not your turn", r2.stderr)
 
-    def test_max_turns_auto_ends(self):
+    def test_max_turns_reached_via_posts_holds_for_host(self):
         chat_id = self.setup_three_way_chat(max_turns=2)
         self.post(chat_id, "claude", "a")
         r = self.post(chat_id, "codex", "b")
-        self.assertIn("(ended)", r.stdout)
+        self.assertIn("next: claude", r.stdout)
         st = self.run_cmd(["status", "--chat", chat_id], check=True)
-        self.assertIn("status: ended", st.stdout)
+        self.assertIn("status: active", st.stdout)
+        self.assertIn("speaker: claude", st.stdout)
+        self.assertIn("turns: 2/2 (at limit", st.stdout)
         tail = self.run_cmd(["tail", "--chat", chat_id], check=True)
-        self.assertIn("max turns reached", tail.stdout)
+        self.assertIn("turn limit reached (2 turns)", tail.stdout)
+
+        # only the host may act now; the next agent in rotation is rejected
+        r2 = self.post(chat_id, "opencode", "c")
+        self.assertEqual(r2.returncode, 2)
+        self.assertIn("not your turn", r2.stderr)
 
     def test_explicit_end_command(self):
         chat_id = self.setup_three_way_chat()
@@ -218,6 +233,65 @@ class TestRotationAndTurns(ChatTestCase):
         self.assertIn("ended", r.stdout)
         tail = self.run_cmd(["tail", "--chat", chat_id], check=True)
         self.assertIn("chat ended by claude", tail.stdout)
+
+
+class TestTurnLimit(ChatTestCase):
+    def reach_limit(self, max_turns=2):
+        chat_id = self.setup_three_way_chat(max_turns=max_turns)
+        self.post(chat_id, "claude", "a")
+        self.post(chat_id, "codex", "b")  # turns_taken == max_turns; speaker becomes host (claude)
+        return chat_id
+
+    def test_host_wait_at_limit_shows_limit_header(self):
+        chat_id = self.reach_limit()
+        r = self.wait(chat_id, "claude", timeout=2)
+        self.assertEqual(r.returncode, 0)
+        self.assertRegex(r.stdout, r"your turn \(\d+/\d+\)")
+        self.assertIn("turn limit reached", r.stdout)
+
+    def test_host_post_at_limit_ends_chat(self):
+        chat_id = self.reach_limit()
+        r = self.post(chat_id, "claude", "closing summary")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("chat ended", r.stdout)
+        st = self.run_cmd(["status", "--chat", chat_id], check=True)
+        self.assertIn("status: ended", st.stdout)
+        tail = self.run_cmd(["tail", "--chat", chat_id], check=True)
+        self.assertIn("chat closed by claude", tail.stdout)
+
+        r2 = self.wait(chat_id, "codex", timeout=2)
+        self.assertEqual(r2.returncode, 3)
+
+
+class TestExtend(ChatTestCase):
+    def test_non_host_extend_rejected(self):
+        chat_id = self.setup_three_way_chat(max_turns=2)
+        r = self.run_cmd(["extend", "--chat", chat_id, "--name", "codex", "--turns", "3"])
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_extend_requires_positive_turns(self):
+        chat_id = self.setup_three_way_chat(max_turns=2)
+        r = self.run_cmd(["extend", "--chat", chat_id, "--name", "claude", "--turns", "0"])
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_host_extend_at_limit_then_post_advances_rotation(self):
+        chat_id = self.setup_three_way_chat(max_turns=2)
+        self.post(chat_id, "claude", "a")
+        self.post(chat_id, "codex", "b")  # at limit; speaker=claude (host)
+
+        r = self.run_cmd(
+            ["extend", "--chat", chat_id, "--name", "claude", "--turns", "3"], check=True
+        )
+        self.assertIn("extended", r.stdout)
+        st = self.run_cmd(["status", "--chat", chat_id], check=True)
+        self.assertIn("speaker: claude", st.stdout)
+        self.assertIn("turns: 2/5", st.stdout)
+        tail = self.run_cmd(["tail", "--chat", chat_id], check=True)
+        self.assertIn("claude extended the chat by 3 turns (now 5)", tail.stdout)
+
+        r2 = self.post(chat_id, "claude", "continuing")
+        self.assertEqual(r2.returncode, 0)
+        self.assertIn("next: codex", r2.stdout)  # rotation resumes normally after the host's turn
 
 
 class TestTimeout(ChatTestCase):
@@ -239,6 +313,24 @@ class TestTimeout(ChatTestCase):
             "SELECT read_seq FROM participants WHERE chat_id=? AND name='claude'", (chat_id,)
         )
         self.assertEqual(rows[0][0], 0)
+
+    def test_timeout_skip_reaching_limit_then_no_further_skip(self):
+        self.write_config(max_turns=2, turn_timeout_s=1, wait_timeout_s=5)
+        chat_id = self.setup_three_way_chat(max_turns=2)
+        self.post(chat_id, "claude", "a")  # turns_taken=1, speaker=codex
+
+        time.sleep(1.5)
+        st = self.run_cmd(["status", "--chat", chat_id], check=True)  # skip pushes turns_taken to the limit
+        self.assertIn("status: active", st.stdout)
+        self.assertIn("speaker: claude", st.stdout)
+        self.assertIn("turns: 2/2 (at limit", st.stdout)
+
+        time.sleep(1.5)  # would be another overdue turn if the timeout still applied
+        st2 = self.run_cmd(["status", "--chat", chat_id], check=True)
+        self.assertIn("speaker: claude", st2.stdout)
+        self.assertIn("turns: 2/2 (at limit", st2.stdout)
+        tail = self.run_cmd(["tail", "--chat", chat_id], check=True)
+        self.assertEqual(tail.stdout.count("skipped"), 1)
 
     def test_wait_exit_codes(self):
         self.write_config(max_turns=12, turn_timeout_s=600, wait_timeout_s=5)
@@ -613,10 +705,25 @@ class TestCodexWaker(ChatTestCase):
         self.assertEqual(pid1, pid2)
 
         self.post(chat_id, "codex", "a")
-        self.post(chat_id, "claude", "b")  # reaches max_turns, chat ends
+        self.post(chat_id, "claude", "b")  # reaches the limit; speaker becomes codex (host)
 
+        # the waker delivers the at-limit turn to the host exactly once
+        self.wait_until(lambda: self.count_invocations() >= 2, 5, "limit turn never queued")
+        content = self.codex_log_content()
+        self.assertIn("turn limit reached", content)
+        self.assertEqual(self.count_invocations(), 2)
+
+        # host decides to extend rather than close; rotation then resumes normally
+        self.run_cmd(["extend", "--chat", chat_id, "--name", "codex", "--turns", "2"], check=True)
+        self.post(chat_id, "codex", "c")
+
+        r = self.wait(chat_id, "claude", timeout=2)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("your turn", r.stdout)
+
+        self.run_cmd(["end", "--chat", chat_id, "--name", "codex"], check=True)
         self.wait_until(lambda: not os.path.exists(pidfile), 8, "waker did not exit after chat ended")
-        self.assertEqual(self.count_invocations(), 1)  # turn 1 queued exactly once, never re-delivered
+        self.assertEqual(self.count_invocations(), 2)  # limit turn queued exactly once, never re-delivered
 
     def test_queue_failure_is_logged_and_not_marked_delivered(self):
         self.set_fake_codex(exit_code=1)

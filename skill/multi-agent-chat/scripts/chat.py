@@ -170,20 +170,31 @@ def advance_turn(conn, chat_id, current_speaker, next_speaker_override):
 
 
 def bump_turns_taken(conn, chat_id, chat):
-    """Increment turns_taken; end the chat with a system message if max_turns is reached.
-    Returns True if the chat ended."""
+    """Increment turns_taken. Reaching max_turns puts the chat "at limit": it stays
+    active, but the turn passes to the host and only the host may act (see `extend`
+    and `cmd_post`'s at-limit branch). Returns True if the chat is now at limit."""
     turns_taken = chat["turns_taken"] + 1
     conn.execute("UPDATE chats SET turns_taken=? WHERE id=?", (turns_taken, chat_id))
     if turns_taken >= chat["max_turns"]:
-        conn.execute("UPDATE chats SET status='ended' WHERE id=?", (chat_id,))
-        add_system_message(conn, chat_id, "max turns reached")
+        conn.execute(
+            "UPDATE chats SET speaker=?, next_speaker=NULL, turn_started_at=? WHERE id=?",
+            (chat["host"], time.time(), chat_id),
+        )
+        add_system_message(
+            conn, chat_id,
+            "turn limit reached (%d turns) · host decides: close or ask the human to extend"
+            % chat["max_turns"],
+        )
         return True
     return False
 
 
 def check_and_apply_timeout(conn, chat):
-    """Lazy per-command check: skip a stalled turn once, if overdue."""
+    """Lazy per-command check: skip a stalled turn once, if overdue.
+    At limit, the chat waits for the host indefinitely; the timeout never fires."""
     if chat is None or chat["status"] != "active" or chat["turn_started_at"] is None:
+        return chat
+    if chat["turns_taken"] >= chat["max_turns"]:
         return chat
     if time.time() - chat["turn_started_at"] <= chat["turn_timeout_s"]:
         return chat
@@ -191,8 +202,8 @@ def check_and_apply_timeout(conn, chat):
     add_system_message(
         conn, chat["id"], "skipped %s (no reply in %ds)" % (speaker, chat["turn_timeout_s"])
     )
-    ended = bump_turns_taken(conn, chat["id"], chat)
-    if not ended:
+    at_limit = bump_turns_taken(conn, chat["id"], chat)
+    if not at_limit:
         advance_turn(conn, chat["id"], speaker, chat["next_speaker"])
     return get_chat(conn, chat["id"])
 
@@ -346,16 +357,33 @@ def cmd_start(args, home, conn):
 
 
 def format_turn_text(chat_id, name, chat, messages, next_after):
-    lines = [
-        "[multi-agent-chat] chat %s · your turn (%d/%d) · next: %s"
-        % (chat_id, chat["turns_taken"] + 1, chat["max_turns"], next_after)
-    ]
+    at_limit = chat["turns_taken"] >= chat["max_turns"]
+    if at_limit:
+        header = "[multi-agent-chat] chat %s · your turn (%d/%d) · turn limit reached — you are the host" % (
+            chat_id, chat["turns_taken"] + 1, chat["max_turns"],
+        )
+    else:
+        header = "[multi-agent-chat] chat %s · your turn (%d/%d) · next: %s" % (
+            chat_id, chat["turns_taken"] + 1, chat["max_turns"], next_after,
+        )
+    lines = [header]
     lines.extend(format_message(row) for row in messages)
     script_path = os.path.abspath(sys.argv[0])
-    lines.append(
-        'Reply: python3 %s post --chat %s --name %s "<text>"   (or --file PATH / --file -)'
-        % (script_path, chat_id, name)
-    )
+    if at_limit:
+        lines.append(
+            "If the discussion is finished: post a closing summary (this ends the chat):\n"
+            "  python3 %s post --chat %s --name %s --file - <<'EOF' ... EOF\n"
+            "Otherwise ask the human in your session whether to extend, telling them to answer "
+            'privately with "// extend N" or "// end the chat". Then run:\n'
+            "  python3 %s extend --chat %s --name %s --turns N   (and take your turn)\n"
+            "  or python3 %s end --chat %s --name %s"
+            % (script_path, chat_id, name, script_path, chat_id, name, script_path, chat_id, name)
+        )
+    else:
+        lines.append(
+            'Reply: python3 %s post --chat %s --name %s "<text>"   (or --file PATH / --file -)'
+            % (script_path, chat_id, name)
+        )
     return "\n".join(lines)
 
 
@@ -432,20 +460,29 @@ def cmd_post(args, home, conn):
             fail("chat is not active", code=2)
         if chat["speaker"] != args.name:
             fail("not your turn (speaker: %s)" % chat["speaker"], code=2)
+        at_limit = chat["turns_taken"] >= chat["max_turns"]
         participant = get_participant(conn, chat_id, args.name)
         seq = add_message(conn, chat_id, args.name, "agent", None, text)
         conn.execute(
             "UPDATE participants SET read_seq=? WHERE chat_id=? AND name=?",
             (participant["shown_seq"], chat_id, args.name),
         )
-        ended = bump_turns_taken(conn, chat_id, chat)
-        if ended:
-            return seq, None
+        if at_limit:
+            # host's post while at limit is the close-or-continue decision: it always ends the chat.
+            conn.execute("UPDATE chats SET status='ended' WHERE id=?", (chat_id,))
+            add_system_message(conn, chat_id, "chat closed by %s" % args.name)
+            return seq, None, True
+        new_at_limit = bump_turns_taken(conn, chat_id, chat)
+        if new_at_limit:
+            return seq, chat["host"], False
         new_speaker = advance_turn(conn, chat_id, args.name, chat["next_speaker"])
-        return seq, new_speaker
+        return seq, new_speaker, False
 
-    seq, new_speaker = with_txn(conn, txn)
-    print("posted #%d · next: %s" % (seq, new_speaker if new_speaker else "(ended)"))
+    seq, new_speaker, ended = with_txn(conn, txn)
+    if ended:
+        print("posted #%d · chat ended" % seq)
+    else:
+        print("posted #%d · next: %s" % (seq, new_speaker))
     return 0
 
 
@@ -466,6 +503,38 @@ def cmd_end(args, home, conn):
     return 0
 
 
+def cmd_extend(args, home, conn):
+    chat_id = resolve_chat_id(conn, args.chat)
+    if args.turns < 1:
+        fail("--turns must be >= 1")
+
+    def txn():
+        chat = get_chat(conn, chat_id)
+        if chat is None:
+            fail("chat %s not found" % chat_id)
+        chat = check_and_apply_timeout(conn, chat)
+        if chat["host"] != args.name:
+            fail("only the host can extend the chat")
+        if chat["status"] != "active":
+            fail("chat is not active")
+        at_limit = chat["turns_taken"] >= chat["max_turns"]
+        new_max = chat["max_turns"] + args.turns
+        conn.execute("UPDATE chats SET max_turns=? WHERE id=?", (new_max, chat_id))
+        if at_limit:
+            # the host's turn only just started for real (it was parked waiting on a
+            # human decision); give it a fresh timeout clock instead of the stale one.
+            conn.execute("UPDATE chats SET turn_started_at=? WHERE id=?", (time.time(), chat_id))
+        add_system_message(
+            conn, chat_id,
+            "%s extended the chat by %d turns (now %d)" % (args.name, args.turns, new_max),
+        )
+        return new_max
+
+    new_max = with_txn(conn, txn)
+    print("chat %s extended to %d turns" % (chat_id, new_max))
+    return 0
+
+
 def cmd_status(args, home, conn):
     chat_id = resolve_chat_id(conn, args.chat)
 
@@ -481,7 +550,11 @@ def cmd_status(args, home, conn):
     print("status: %s" % chat["status"])
     print("roster: %s" % ", ".join(r["name"] for r in roster(conn, chat_id)))
     print("speaker: %s" % chat["speaker"])
-    print("turns: %d/%d" % (chat["turns_taken"], chat["max_turns"]))
+    at_limit = chat["status"] == "active" and chat["turns_taken"] >= chat["max_turns"]
+    if at_limit:
+        print("turns: %d/%d (at limit — waiting for host)" % (chat["turns_taken"], chat["max_turns"]))
+    else:
+        print("turns: %d/%d" % (chat["turns_taken"], chat["max_turns"]))
     return 0
 
 
@@ -515,14 +588,42 @@ def cmd_tail(args, home, conn):
             return "31"
         return colors.setdefault(row["sender"], TAIL_COLORS[len(colors) % len(TAIL_COLORS)])
 
-    while True:
+    def note(text):
+        # grey/90, matching format_tail_message's system-message color
+        print("\033[1;90m%s\033[0m" % text if sys.stdout.isatty() else text)
+
+    def fetch_chat():
         def txn():
             chat = get_chat(conn, chat_id)
             if chat is None:
                 fail("chat %s not found" % chat_id)
             return check_and_apply_timeout(conn, chat)
 
-        chat = with_txn(conn, txn)
+        return with_txn(conn, txn)
+
+    def current_roster():
+        return ", ".join(r["name"] for r in roster(conn, chat_id))
+
+    # A lobby chat has no messages yet, so tail would otherwise print nothing at all.
+    chat = fetch_chat()
+    prev_status = chat["status"]
+    prev_roster = current_roster()
+    note("chat %s · %s · %s · %s" % (chat_id, prev_status, prev_roster, chat["topic"][:80]))
+
+    first = True
+    while True:
+        if not first:
+            chat = fetch_chat()
+            if chat["status"] != prev_status:
+                note("· status: %s" % chat["status"])
+                prev_status = chat["status"]
+            if chat["status"] == "lobby":
+                cur_roster = current_roster()
+                if cur_roster != prev_roster:
+                    note("· roster: %s" % cur_roster)
+                    prev_roster = cur_roster
+        first = False
+
         rows = conn.execute(
             "SELECT * FROM messages WHERE chat_id=? AND seq>? ORDER BY seq", (chat_id, last_seq)
         ).fetchall()
@@ -788,6 +889,12 @@ def build_parser():
     e.add_argument("--chat", default=None)
     e.add_argument("--name", default=None)
     e.set_defaults(func=cmd_end)
+
+    ex = sub.add_parser("extend")
+    ex.add_argument("--chat", default=None)
+    ex.add_argument("--name", required=True)
+    ex.add_argument("--turns", type=int, required=True)
+    ex.set_defaults(func=cmd_extend)
 
     st = sub.add_parser("status")
     st.add_argument("--chat", default=None)

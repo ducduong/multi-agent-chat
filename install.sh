@@ -120,10 +120,18 @@ install() {
     [ -f "$HOME/.codex/hooks.json" ] && cp "$HOME/.codex/hooks.json" "$backup_dir/codex-hooks.json"
   fi
 
-  rm -rf "$MAC_HOME/skill" "$MAC_HOME/adapters"
-  mkdir -p "$MAC_HOME/skill" "$MAC_HOME/adapters"
-  cp -R "$REPO_ROOT/skill/." "$MAC_HOME/skill/"
-  cp -R "$REPO_ROOT/adapters/." "$MAC_HOME/adapters/"
+  rm -rf "$MAC_HOME/skill.new" "$MAC_HOME/adapters.new" "$MAC_HOME/skill.old" "$MAC_HOME/adapters.old"
+  mkdir -p "$MAC_HOME/skill.new" "$MAC_HOME/adapters.new"
+  cp -R "$REPO_ROOT/skill/." "$MAC_HOME/skill.new/"
+  cp -R "$REPO_ROOT/adapters/." "$MAC_HOME/adapters.new/"
+
+  # Copy-then-swap: skill/ is imported by a running chat via a symlink, so it
+  # must never be observed missing mid-install.
+  if [ -d "$MAC_HOME/skill" ]; then mv "$MAC_HOME/skill" "$MAC_HOME/skill.old"; fi
+  if [ -d "$MAC_HOME/adapters" ]; then mv "$MAC_HOME/adapters" "$MAC_HOME/adapters.old"; fi
+  mv "$MAC_HOME/skill.new" "$MAC_HOME/skill"
+  mv "$MAC_HOME/adapters.new" "$MAC_HOME/adapters"
+  rm -rf "$MAC_HOME/skill.old" "$MAC_HOME/adapters.old"
 
   if [ ! -f "$MAC_HOME/config.json" ]; then
     /usr/bin/python3 -c "

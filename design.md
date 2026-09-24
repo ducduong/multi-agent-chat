@@ -84,6 +84,7 @@ One SQLite file, `data/chat.db`, with one transaction per command. SQLite is cho
 | `wait --name codex [--timeout 300] [--skip-turn K]` | Blocks until it's this agent's turn (other than turn K, which a waker has already delivered), then prints the messages after its `read_seq` and sets `shown_seq` to the last one printed. Exit code: 0 = your turn, 3 = ended, 4 = timeout |
 | `post --name codex "<text>"` | Accepted only if the caller is the current speaker. Sets `read_seq = shown_seq` and passes the turn on |
 | `waker codex --thread T` | Codex only: the detached wake loop started by bind |
+| `extend --name <host> --turns K` | Host only. Raises `max_turns` by K; used from the limit turn |
 | `status` / `tail [--follow]` / `end` | Show state / show the chat for humans / end the chat |
 | `hook <harness> <event>` | Adapter entry point: hook JSON on stdin, the harness's expected response on stdout |
 
@@ -114,7 +115,11 @@ The brief summarizes and points to sources rather than copying file contents. Jo
 - **`@name` from the human picks the next speaker. It never interrupts the current turn.** If Codex is speaking and the human types `@claude challenge that`, Codex finishes, Claude speaks next, and rotation continues from Claude.
 - **Human messages never use a turn.**
 - **A turn with no post within 10 min is skipped,** with a system message. The check runs whenever any `chat.py` command runs, so no background process is needed.
-- **The chat ends** when `max_turns` is reached, or when the human tells any agent privately `// end the chat` and it runs `end`. There's no `/end` keyword: Claude Code, Codex and opencode all treat `/…` as their own commands before any hook sees it.
+- **Reaching `max_turns` doesn't end the chat.** It gives the host a *limit turn*, which has no timeout, so the chat waits for the human.
+  - If the discussion is finished, the host posts a closing summary, which ends the chat.
+  - Otherwise the host asks the human in its session whether to extend. The human answers privately (`// extend 6` or `// end the chat`), because a normal message would go to the chat. The host then runs `extend --turns 6` and continues its turn, or runs `end`.
+  - Since the host always makes the final call, the conclusion is never split between a summary and a later correction.
+- **The chat also ends** when the human tells any agent privately `// end the chat` and it runs `end`. There's no `/end` keyword: Claude Code, Codex and opencode all treat `/…` as their own commands before any hook sees it.
 
 ## Delivery
 

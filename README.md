@@ -25,6 +25,8 @@ While the chat is running:
 | `// summarize so far` | Private to that agent; not posted |
 | `// end the chat` | That agent ends the chat |
 
+At the turn limit, the host either closes the chat with a summary or asks you whether to extend. Answer privately: `// extend 6` or `// end the chat`.
+
 ## Watch
 
 ```
