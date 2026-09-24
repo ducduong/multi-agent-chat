@@ -1,0 +1,798 @@
+#!/usr/bin/env python3
+"""multi-agent-chat store + CLI. Stdlib only, targets /usr/bin/python3 (3.9)."""
+
+import argparse
+import json
+import os
+import random
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+
+DEFAULT_CONFIG = {"max_turns": 12, "turn_timeout_s": 600, "wait_timeout_s": 300}
+BRIEF_MAX_BYTES = 16384
+MENTION_RE = re.compile(r"(?<![\w@])@(\w+)")
+BIND_RE = re.compile(r"MAC_BIND chat=([0-9]{8}-[0-9a-f]{4}) name=([a-z0-9_]+)")
+NAME_RE = re.compile(r"^[a-z0-9_]{1,32}$")
+TURN_HEADER_RE = re.compile(r"your turn \((\d+)/\d+\)")
+CODEX_WAKER_TIMEOUT_S = 300
+CODEX_QUEUE_RETRY_S = 5
+
+
+def get_home():
+    return os.environ.get("MAC_HOME") or os.path.expanduser("~/.multi-agent-chat")
+
+
+def get_config(home):
+    cfg = dict(DEFAULT_CONFIG)
+    path = os.path.join(home, "config.json")
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cfg.update(json.load(f))
+        except (IOError, ValueError):
+            pass
+    return cfg
+
+
+def get_db(home):
+    data_dir = os.path.join(home, "data")
+    os.makedirs(data_dir, exist_ok=True)
+    conn = sqlite3.connect(os.path.join(data_dir, "chat.db"), isolation_level=None, timeout=5)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    init_schema(conn)
+    return conn
+
+
+def init_schema(conn):
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS chats (
+        id TEXT PRIMARY KEY, topic TEXT, brief TEXT, host TEXT, status TEXT,
+        speaker TEXT, turn_started_at REAL, next_speaker TEXT,
+        turns_taken INTEGER, max_turns INTEGER, turn_timeout_s INTEGER, created_at REAL
+    )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS participants (
+        chat_id TEXT, name TEXT, harness TEXT, position INTEGER,
+        shown_seq INTEGER, read_seq INTEGER, UNIQUE(chat_id, name)
+    )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS messages (
+        chat_id TEXT, seq INTEGER, ts REAL, sender TEXT, kind TEXT, via TEXT, text TEXT,
+        UNIQUE(chat_id, seq)
+    )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS sessions (
+        harness TEXT, session_id TEXT, chat_id TEXT, name TEXT,
+        PRIMARY KEY (harness, session_id)
+    )"""
+    )
+
+
+def fail(msg, code=1):
+    sys.stderr.write(msg + "\n")
+    sys.exit(code)
+
+
+def validate_name(name):
+    """Mention parsing (MENTION_RE) assumes names are plain \\w tokens."""
+    if not NAME_RE.match(name):
+        fail("invalid name %r: must match ^[a-z0-9_]{1,32}$" % name)
+
+
+def with_txn(conn, fn):
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        result = fn()
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+    return result
+
+
+def gen_chat_id(conn):
+    for _ in range(20):
+        cid = time.strftime("%Y%m%d") + "-" + "%04x" % random.randint(0, 0xFFFF)
+        if conn.execute("SELECT 1 FROM chats WHERE id=?", (cid,)).fetchone() is None:
+            return cid
+    fail("could not generate a unique chat id")
+
+
+def get_chat(conn, chat_id):
+    return conn.execute("SELECT * FROM chats WHERE id=?", (chat_id,)).fetchone()
+
+
+def get_participant(conn, chat_id, name):
+    return conn.execute(
+        "SELECT * FROM participants WHERE chat_id=? AND name=?", (chat_id, name)
+    ).fetchone()
+
+
+def roster(conn, chat_id):
+    return conn.execute(
+        "SELECT name FROM participants WHERE chat_id=? ORDER BY position", (chat_id,)
+    ).fetchall()
+
+
+def resolve_chat_id(conn, chat_id):
+    if chat_id:
+        return chat_id
+    row = conn.execute("SELECT id FROM chats ORDER BY created_at DESC, rowid DESC LIMIT 1").fetchone()
+    if row is None:
+        fail("no chat found (pass --chat)")
+    return row["id"]
+
+
+def add_message(conn, chat_id, sender, kind, via, text):
+    seq = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE chat_id=?", (chat_id,)
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO messages (chat_id, seq, ts, sender, kind, via, text) VALUES (?,?,?,?,?,?,?)",
+        (chat_id, seq, time.time(), sender, kind, via, text),
+    )
+    return seq
+
+
+def add_system_message(conn, chat_id, text):
+    return add_message(conn, chat_id, "system", "system", None, text)
+
+
+def pick_next_speaker(conn, chat_id, current_speaker, next_speaker_override):
+    if next_speaker_override:
+        if get_participant(conn, chat_id, next_speaker_override) is not None:
+            return next_speaker_override
+    names = [r["name"] for r in roster(conn, chat_id)]
+    if not names:
+        return None
+    if current_speaker not in names:
+        return names[0]
+    idx = names.index(current_speaker)
+    return names[(idx + 1) % len(names)]
+
+
+def advance_turn(conn, chat_id, current_speaker, next_speaker_override):
+    new_speaker = pick_next_speaker(conn, chat_id, current_speaker, next_speaker_override)
+    conn.execute(
+        "UPDATE chats SET speaker=?, next_speaker=NULL, turn_started_at=? WHERE id=?",
+        (new_speaker, time.time(), chat_id),
+    )
+    return new_speaker
+
+
+def bump_turns_taken(conn, chat_id, chat):
+    """Increment turns_taken; end the chat with a system message if max_turns is reached.
+    Returns True if the chat ended."""
+    turns_taken = chat["turns_taken"] + 1
+    conn.execute("UPDATE chats SET turns_taken=? WHERE id=?", (turns_taken, chat_id))
+    if turns_taken >= chat["max_turns"]:
+        conn.execute("UPDATE chats SET status='ended' WHERE id=?", (chat_id,))
+        add_system_message(conn, chat_id, "max turns reached")
+        return True
+    return False
+
+
+def check_and_apply_timeout(conn, chat):
+    """Lazy per-command check: skip a stalled turn once, if overdue."""
+    if chat is None or chat["status"] != "active" or chat["turn_started_at"] is None:
+        return chat
+    if time.time() - chat["turn_started_at"] <= chat["turn_timeout_s"]:
+        return chat
+    speaker = chat["speaker"]
+    add_system_message(
+        conn, chat["id"], "skipped %s (no reply in %ds)" % (speaker, chat["turn_timeout_s"])
+    )
+    ended = bump_turns_taken(conn, chat["id"], chat)
+    if not ended:
+        advance_turn(conn, chat["id"], speaker, chat["next_speaker"])
+    return get_chat(conn, chat["id"])
+
+
+def add_human(conn, chat, via, text):
+    """Insert a human message; @mentions set next_speaker (last one wins)."""
+    seq = add_message(conn, chat["id"], "human", "human", via, text)
+    names = set(r["name"] for r in roster(conn, chat["id"]))
+    mentioned = [m for m in MENTION_RE.findall(text) if m in names]
+    if mentioned:
+        conn.execute("UPDATE chats SET next_speaker=? WHERE id=?", (mentioned[-1], chat["id"]))
+    return seq
+
+
+def format_message(row):
+    if row["kind"] == "agent":
+        return "[%d] %s (agent): %s" % (row["seq"], row["sender"], row["text"])
+    if row["kind"] == "human":
+        return "[%d] human via %s: %s" % (row["seq"], row["via"], row["text"])
+    return "[%d] system: %s" % (row["seq"], row["text"])
+
+
+def read_text_arg(text_arg, file_arg):
+    if file_arg:
+        if file_arg == "-":
+            return sys.stdin.read()
+        with open(file_arg, "r", encoding="utf-8") as f:
+            return f.read()
+    if text_arg is None:
+        fail("either TEXT or --file is required")
+    return text_arg
+
+
+# ---- commands ----
+
+
+def cmd_create(args, home, conn):
+    validate_name(args.name)
+    cfg = get_config(home)
+    max_turns = args.max_turns if args.max_turns is not None else cfg["max_turns"]
+    chat_id = gen_chat_id(conn)
+
+    def txn():
+        conn.execute(
+            "INSERT INTO chats (id, topic, brief, host, status, speaker, turn_started_at, "
+            "next_speaker, turns_taken, max_turns, turn_timeout_s, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                chat_id, args.topic, None, args.name, "lobby", None, None, None,
+                0, max_turns, cfg["turn_timeout_s"], time.time(),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO participants (chat_id, name, harness, position, shown_seq, read_seq) "
+            "VALUES (?,?,?,0,0,0)",
+            (chat_id, args.name, args.harness or ""),
+        )
+
+    with_txn(conn, txn)
+    print(chat_id)
+    print("MAC_BIND chat=%s name=%s" % (chat_id, args.name))
+    return 0
+
+
+def cmd_brief(args, home, conn):
+    chat_id = resolve_chat_id(conn, args.chat)
+    data = sys.stdin.buffer.read() if args.file == "-" else open(args.file, "rb").read()
+    if len(data) > BRIEF_MAX_BYTES:
+        fail("brief exceeds %d bytes" % BRIEF_MAX_BYTES)
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        fail("brief must be valid UTF-8")
+
+    def txn():
+        chat = get_chat(conn, chat_id)
+        if chat is None:
+            fail("chat %s not found" % chat_id)
+        chat = check_and_apply_timeout(conn, chat)
+        if chat["host"] != args.name:
+            fail("only the host can set the brief")
+        if chat["status"] != "lobby":
+            fail("brief can only be set before the chat starts")
+        conn.execute("UPDATE chats SET brief=? WHERE id=?", (text, chat_id))
+
+    with_txn(conn, txn)
+    print("brief set")
+    return 0
+
+
+def cmd_join(args, home, conn):
+    validate_name(args.name)
+    if args.latest:
+        chat_id = resolve_chat_id(conn, None)
+    elif args.chat_id:
+        chat_id = args.chat_id
+    else:
+        fail("pass a chat id or --latest")
+
+    def txn():
+        chat = get_chat(conn, chat_id)
+        if chat is None:
+            fail("chat %s not found" % chat_id)
+        chat = check_and_apply_timeout(conn, chat)
+        if chat["status"] != "lobby":
+            fail("chat is not in lobby")
+        if get_participant(conn, chat_id, args.name) is not None:
+            fail("name %s is already taken in this chat" % args.name)
+        pos = conn.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM participants WHERE chat_id=?", (chat_id,)
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO participants (chat_id, name, harness, position, shown_seq, read_seq) "
+            "VALUES (?,?,?,?,0,0)",
+            (chat_id, args.name, args.harness or "", pos),
+        )
+        return chat
+
+    chat = with_txn(conn, txn)
+    print("topic: %s" % chat["topic"])
+    print("brief:")
+    print(chat["brief"] if chat["brief"] else "(none)")
+    print("roster: %s" % ", ".join(r["name"] for r in roster(conn, chat_id)))
+    print("MAC_BIND chat=%s name=%s" % (chat_id, args.name))
+    return 0
+
+
+def cmd_start(args, home, conn):
+    chat_id = resolve_chat_id(conn, args.chat)
+
+    def txn():
+        chat = get_chat(conn, chat_id)
+        if chat is None:
+            fail("chat %s not found" % chat_id)
+        chat = check_and_apply_timeout(conn, chat)
+        if chat["host"] != args.name:
+            fail("only the host can start the chat")
+        if chat["status"] != "lobby":
+            fail("chat already started")
+        names = [r["name"] for r in roster(conn, chat_id)]
+        conn.execute(
+            "UPDATE chats SET status='active', speaker=?, turn_started_at=?, next_speaker=NULL "
+            "WHERE id=?",
+            (chat["host"], time.time(), chat_id),
+        )
+        add_system_message(conn, chat_id, "chat started · order: %s" % " → ".join(names))
+
+    with_txn(conn, txn)
+    print("chat %s started" % chat_id)
+    return 0
+
+
+def format_turn_text(chat_id, name, chat, messages, next_after):
+    lines = [
+        "[multi-agent-chat] chat %s · your turn (%d/%d) · next: %s"
+        % (chat_id, chat["turns_taken"] + 1, chat["max_turns"], next_after)
+    ]
+    lines.extend(format_message(row) for row in messages)
+    script_path = os.path.abspath(sys.argv[0])
+    lines.append(
+        'Reply: python3 %s post --chat %s --name %s "<text>"   (or --file PATH / --file -)'
+        % (script_path, chat_id, name)
+    )
+    return "\n".join(lines)
+
+
+def wait_for_turn(conn, chat_id, name, timeout, skip_turn):
+    """Block until it's `name`'s turn, the chat ends, or `timeout` elapses.
+
+    `skip_turn`, when set, is a turn number (turns_taken+1) already delivered:
+    that turn is not returned again, so a caller re-polling after delivering it
+    doesn't re-deliver the same turn while waiting for the post that ends it.
+    Returns (exit_code, text): 0 (turn, text is the turn block), 3 (ended) or
+    4 (timed out; text is a one-line status message).
+    """
+    deadline = time.time() + timeout
+
+    def check():
+        chat = get_chat(conn, chat_id)
+        if chat is None:
+            fail("chat %s not found" % chat_id)
+        chat = check_and_apply_timeout(conn, chat)
+        if chat["status"] == "ended":
+            return ("ended", None)
+        if chat["status"] == "active" and chat["speaker"] == name:
+            turn_number = chat["turns_taken"] + 1
+            if skip_turn is not None and turn_number == skip_turn:
+                return (None, None)
+            participant = get_participant(conn, chat_id, name)
+            messages = conn.execute(
+                "SELECT * FROM messages WHERE chat_id=? AND seq>? AND sender!=? ORDER BY seq",
+                (chat_id, participant["read_seq"], name),
+            ).fetchall()
+            max_seq = conn.execute(
+                "SELECT COALESCE(MAX(seq), ?) FROM messages WHERE chat_id=?",
+                (participant["read_seq"], chat_id),
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE participants SET shown_seq=? WHERE chat_id=? AND name=?",
+                (max_seq, chat_id, name),
+            )
+            next_after = pick_next_speaker(conn, chat_id, name, chat["next_speaker"])
+            return ("turn", (chat, messages, next_after))
+        return (None, None)
+
+    while True:
+        kind, payload = with_txn(conn, check)
+        if kind == "ended":
+            return 3, "[multi-agent-chat] chat %s ended" % chat_id
+        if kind == "turn":
+            chat, messages, next_after = payload
+            return 0, format_turn_text(chat_id, name, chat, messages, next_after)
+        if time.time() >= deadline:
+            return 4, "[multi-agent-chat] chat %s · wait timed out" % chat_id
+        time.sleep(1)
+
+
+def cmd_wait(args, home, conn):
+    chat_id = resolve_chat_id(conn, args.chat)
+    cfg = get_config(home)
+    timeout = args.timeout if args.timeout is not None else cfg["wait_timeout_s"]
+    code, text = wait_for_turn(conn, chat_id, args.name, timeout, args.skip_turn)
+    print(text)
+    return code
+
+
+def cmd_post(args, home, conn):
+    chat_id = resolve_chat_id(conn, args.chat)
+    text = read_text_arg(args.text, args.file)
+
+    def txn():
+        chat = get_chat(conn, chat_id)
+        if chat is None:
+            fail("chat %s not found" % chat_id)
+        chat = check_and_apply_timeout(conn, chat)
+        if chat["status"] != "active":
+            fail("chat is not active", code=2)
+        if chat["speaker"] != args.name:
+            fail("not your turn (speaker: %s)" % chat["speaker"], code=2)
+        participant = get_participant(conn, chat_id, args.name)
+        seq = add_message(conn, chat_id, args.name, "agent", None, text)
+        conn.execute(
+            "UPDATE participants SET read_seq=? WHERE chat_id=? AND name=?",
+            (participant["shown_seq"], chat_id, args.name),
+        )
+        ended = bump_turns_taken(conn, chat_id, chat)
+        if ended:
+            return seq, None
+        new_speaker = advance_turn(conn, chat_id, args.name, chat["next_speaker"])
+        return seq, new_speaker
+
+    seq, new_speaker = with_txn(conn, txn)
+    print("posted #%d · next: %s" % (seq, new_speaker if new_speaker else "(ended)"))
+    return 0
+
+
+def cmd_end(args, home, conn):
+    chat_id = resolve_chat_id(conn, args.chat)
+
+    def txn():
+        chat = get_chat(conn, chat_id)
+        if chat is None:
+            fail("chat %s not found" % chat_id)
+        if chat["status"] == "ended":
+            return
+        conn.execute("UPDATE chats SET status='ended' WHERE id=?", (chat_id,))
+        add_system_message(conn, chat_id, "chat ended by %s" % (args.name or "human"))
+
+    with_txn(conn, txn)
+    print("chat %s ended" % chat_id)
+    return 0
+
+
+def cmd_status(args, home, conn):
+    chat_id = resolve_chat_id(conn, args.chat)
+
+    def txn():
+        chat = get_chat(conn, chat_id)
+        if chat is None:
+            fail("chat %s not found" % chat_id)
+        return check_and_apply_timeout(conn, chat)
+
+    chat = with_txn(conn, txn)
+    print("id: %s" % chat["id"])
+    print("topic: %s" % chat["topic"])
+    print("status: %s" % chat["status"])
+    print("roster: %s" % ", ".join(r["name"] for r in roster(conn, chat_id)))
+    print("speaker: %s" % chat["speaker"])
+    print("turns: %d/%d" % (chat["turns_taken"], chat["max_turns"]))
+    return 0
+
+
+def cmd_tail(args, home, conn):
+    chat_id = resolve_chat_id(conn, args.chat)
+    last_seq = 0
+    while True:
+        def txn():
+            chat = get_chat(conn, chat_id)
+            if chat is None:
+                fail("chat %s not found" % chat_id)
+            return check_and_apply_timeout(conn, chat)
+
+        chat = with_txn(conn, txn)
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE chat_id=? AND seq>? ORDER BY seq", (chat_id, last_seq)
+        ).fetchall()
+        for row in rows:
+            print(format_message(row))
+            last_seq = row["seq"]
+        if not args.follow or chat["status"] == "ended":
+            return 0
+        time.sleep(1)
+
+
+# ---- codex waker ----
+
+
+def wakers_dir(home):
+    d = os.path.join(home, "data", "wakers")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def waker_pidfile(home, chat_id, name):
+    return os.path.join(wakers_dir(home), "%s-%s.pid" % (chat_id, name))
+
+
+def waker_logfile(home, chat_id, name):
+    return os.path.join(wakers_dir(home), "%s-%s.log" % (chat_id, name))
+
+
+def waker_is_alive(pidfile):
+    if not os.path.exists(pidfile):
+        return False
+    try:
+        with open(pidfile, "r", encoding="utf-8") as f:
+            pid = int(f.read().strip())
+    except (IOError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def resolve_codex_bin():
+    return os.environ.get("MAC_CODEX_BIN") or shutil.which("codex") or "/opt/homebrew/bin/codex"
+
+
+def spawn_codex_waker(home, chat_id, name, thread):
+    pidfile = waker_pidfile(home, chat_id, name)
+    if waker_is_alive(pidfile):
+        return
+    script_path = os.path.abspath(sys.argv[0])
+    log_path = waker_logfile(home, chat_id, name)
+    with open(log_path, "a", encoding="utf-8") as logf:
+        subprocess.Popen(
+            [sys.executable, script_path, "waker", "codex", "--chat", chat_id, "--name", name,
+             "--thread", thread],
+            stdin=subprocess.DEVNULL,
+            stdout=logf,
+            stderr=logf,
+            start_new_session=True,
+        )
+
+
+def cmd_waker(args, home, conn):
+    if args.harness != "codex":
+        fail("unknown waker harness: %s" % args.harness)
+    chat_id, name = args.chat, args.name
+    pidfile = waker_pidfile(home, chat_id, name)
+    if waker_is_alive(pidfile):
+        fail("a waker for %s/%s is already running" % (chat_id, name))
+    with open(pidfile, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+
+    codex_bin = resolve_codex_bin()
+    log_path = waker_logfile(home, chat_id, name)
+    last_delivered = None
+    try:
+        while True:
+            code, text = wait_for_turn(conn, chat_id, name, CODEX_WAKER_TIMEOUT_S, last_delivered)
+            if code == 3:
+                return 0
+            if code == 4:
+                continue
+            m = TURN_HEADER_RE.search(text)
+            turn_number = int(m.group(1)) if m else None
+            try:
+                subprocess.run([codex_bin, "queue", "--thread", args.thread, "--message", text],
+                                check=True)
+                last_delivered = turn_number
+            except (OSError, subprocess.CalledProcessError) as e:
+                with open(log_path, "a", encoding="utf-8") as logf:
+                    logf.write("%s codex queue failed: %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), e))
+                time.sleep(CODEX_QUEUE_RETRY_S)
+    finally:
+        try:
+            os.remove(pidfile)
+        except OSError:
+            pass
+
+
+# ---- hooks ----
+
+
+def extract_claude(data):
+    return data.get("session_id"), data.get("prompt") or ""
+
+
+def extract_codex(data):
+    return data.get("session_id"), data.get("prompt") or ""
+
+
+def extract_opencode(data):
+    return data.get("session_id"), data.get("prompt") or ""
+
+
+# Kept as one dict of small per-harness functions: hook field names may be
+# remapped later, so a change is isolated to one function.
+EXTRACTORS = {"claude": extract_claude, "codex": extract_codex, "opencode": extract_opencode}
+
+
+def emit_pass(harness):
+    if harness == "opencode":
+        print(json.dumps({"action": "pass", "message": ""}))
+
+
+def emit_block(harness, message):
+    if harness == "opencode":
+        print(json.dumps({"action": "block", "message": message}))
+    else:
+        print(json.dumps({"decision": "block", "reason": message}))
+
+
+def cmd_hook(args, home, conn_unused):
+    data = json.load(sys.stdin)
+    if args.event == "relay":
+        hook_relay(args.harness, data, home)
+    elif args.event == "bind":
+        hook_bind(args.harness, data, home)
+    else:
+        fail("unknown hook event: %s" % args.event)
+    return 0
+
+
+def strip_wrapping_quotes(text):
+    """opencode's `run` wraps the injected prompt in double quotes."""
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        return text[1:-1]
+    return text
+
+
+def hook_relay(harness, data, home):
+    extractor = EXTRACTORS.get(harness, extract_claude)
+    session_id, prompt = extractor(data)
+    prompt = strip_wrapping_quotes(prompt)
+
+    db_path = os.path.join(home, "data", "chat.db")
+    if not os.path.exists(db_path):
+        return emit_pass(harness)
+
+    conn = get_db(home)
+    session = conn.execute(
+        "SELECT chat_id, name FROM sessions WHERE harness=? AND session_id=?", (harness, session_id)
+    ).fetchone()
+    if session is None:
+        return emit_pass(harness)
+
+    chat_id, name = session["chat_id"], session["name"]
+    try:
+        chat = get_chat(conn, chat_id)  # None (chat row missing) falls through to the except below
+        if chat["status"] != "active":
+            # lobby: the human is setting up the chat with the host, e.g. "start the chat" —
+            # that must reach the host normally, not be posted or blocked.
+            return emit_pass(harness)
+        stripped = prompt.lstrip()
+        # Claude Code delivers background-task completions (the wake for a
+        # background `wait`) through UserPromptSubmit as <task-notification>.
+        if stripped.startswith(("[multi-agent-chat]", "//", "<task-notification>")):
+            return emit_pass(harness)
+
+        def txn():
+            c = check_and_apply_timeout(conn, get_chat(conn, chat_id))
+            return add_human(conn, c, name, prompt)
+
+        seq = with_txn(conn, txn)
+        return emit_block(harness, "posted to chat %s as #%d" % (chat_id, seq))
+    except Exception as e:  # session was found bound; any failure from here on blocks
+        return emit_block(harness, "multi-agent-chat relay failed: %s — message NOT posted" % e)
+
+
+def hook_bind(harness, data, home):
+    session_id = data.get("session_id")
+    tool_response = data.get("tool_response")
+    text = tool_response if isinstance(tool_response, str) else json.dumps(tool_response)
+    m = BIND_RE.search(text)
+    if m is not None:
+        chat_id, name = m.group(1), m.group(2)
+        conn = get_db(home)
+
+        def txn():
+            conn.execute(
+                "INSERT INTO sessions (harness, session_id, chat_id, name) VALUES (?,?,?,?) "
+                "ON CONFLICT(harness, session_id) DO UPDATE SET chat_id=excluded.chat_id, "
+                "name=excluded.name",
+                (harness, session_id, chat_id, name),
+            )
+
+        with_txn(conn, txn)
+        if harness == "codex":
+            spawn_codex_waker(home, chat_id, name, session_id)
+    if harness == "opencode":
+        print(json.dumps({"action": "pass"}))
+
+
+# ---- argument parsing ----
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="chat.py")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    c = sub.add_parser("create")
+    c.add_argument("--name", required=True)
+    c.add_argument("--topic", required=True)
+    c.add_argument("--max-turns", type=int, dest="max_turns", default=None)
+    c.add_argument("--harness", default=None)
+    c.set_defaults(func=cmd_create)
+
+    b = sub.add_parser("brief")
+    b.add_argument("--chat", default=None)
+    b.add_argument("--name", required=True)
+    b.add_argument("--file", required=True)
+    b.set_defaults(func=cmd_brief)
+
+    j = sub.add_parser("join")
+    j.add_argument("chat_id", nargs="?", default=None)
+    j.add_argument("--latest", action="store_true")
+    j.add_argument("--name", required=True)
+    j.add_argument("--harness", default=None)
+    j.set_defaults(func=cmd_join)
+
+    s = sub.add_parser("start")
+    s.add_argument("--chat", default=None)
+    s.add_argument("--name", required=True)
+    s.set_defaults(func=cmd_start)
+
+    w = sub.add_parser("wait")
+    w.add_argument("--chat", default=None)
+    w.add_argument("--name", required=True)
+    w.add_argument("--timeout", type=float, default=None)
+    w.add_argument("--skip-turn", type=int, dest="skip_turn", default=None)
+    w.set_defaults(func=cmd_wait)
+
+    po = sub.add_parser("post")
+    po.add_argument("--chat", default=None)
+    po.add_argument("--name", required=True)
+    po.add_argument("text", nargs="?", default=None)
+    po.add_argument("--file", default=None)
+    po.set_defaults(func=cmd_post)
+
+    e = sub.add_parser("end")
+    e.add_argument("--chat", default=None)
+    e.add_argument("--name", default=None)
+    e.set_defaults(func=cmd_end)
+
+    st = sub.add_parser("status")
+    st.add_argument("--chat", default=None)
+    st.set_defaults(func=cmd_status)
+
+    t = sub.add_parser("tail")
+    t.add_argument("--chat", default=None)
+    t.add_argument("--follow", action="store_true")
+    t.set_defaults(func=cmd_tail)
+
+    h = sub.add_parser("hook")
+    h.add_argument("harness")
+    h.add_argument("event")
+    h.set_defaults(func=cmd_hook)
+
+    wk = sub.add_parser("waker")
+    wk.add_argument("harness")
+    wk.add_argument("--chat", required=True)
+    wk.add_argument("--name", required=True)
+    wk.add_argument("--thread", required=True)
+    wk.set_defaults(func=cmd_waker)
+
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    home = get_home()
+    # hook relay must be able to tell "no DB file yet" apart from "unbound session",
+    # so it opens (and thus creates) the db itself, only once a bound session is possible.
+    conn = None if args.command == "hook" else get_db(home)
+    return args.func(args, home, conn)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
