@@ -556,7 +556,7 @@ class TestConcurrency(ChatTestCase):
 
 class TestNameValidation(ChatTestCase):
     def test_create_rejects_invalid_names(self):
-        for bad in ["Claude", "cla ude", "cla-ude", "", "x" * 33]:
+        for bad in ["Claude", "cla ude", "-claude", "claude-", "", "x" * 33]:
             r = self.run_cmd(["create", "--name", bad, "--topic", "t"])
             self.assertNotEqual(r.returncode, 0, bad)
 
@@ -569,6 +569,20 @@ class TestNameValidation(ChatTestCase):
         chat_id = self.create_chat(name="agent_1", topic="t")
         r = self.join(chat_id, "abc123", check=False)
         self.assertEqual(r.returncode, 0)
+        r = self.join(chat_id, "claude-fable", check=False)
+        self.assertEqual(r.returncode, 0)
+
+    def test_hyphenated_names_bind_and_mention(self):
+        chat_id = self.create_chat(name="claude-opus", topic="t")
+        self.join(chat_id, "claude-fable")
+        self.join(chat_id, "codex-sol")
+        self.start(chat_id, "claude-opus")
+        self.bind("claude", "s1", chat_id, "claude-fable", as_object=True)
+        rows = self.query("SELECT name FROM sessions WHERE session_id='s1'")
+        self.assertEqual(rows[0][0], "claude-fable")
+        self.relay("claude", "s1", "thoughts, @Codex-Sol?")
+        rows = self.query("SELECT next_speaker FROM chats WHERE id=?", (chat_id,))
+        self.assertEqual(rows[0][0], "codex-sol")
 
 
 class TestSkipTurn(ChatTestCase):

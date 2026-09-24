@@ -14,9 +14,10 @@ import time
 
 DEFAULT_CONFIG = {"max_turns": 12, "turn_timeout_s": 600, "wait_timeout_s": 300}
 BRIEF_MAX_BYTES = 16384
-MENTION_RE = re.compile(r"(?<![\w@])@(\w+)")
-BIND_RE = re.compile(r"MAC_BIND chat=([0-9]{8}-[0-9a-f]{4}) name=([a-z0-9_]+)")
-NAME_RE = re.compile(r"^[a-z0-9_]{1,32}$")
+MENTION_RE = re.compile(r"(?<![\w@])@([a-z0-9](?:[a-z0-9_-]*[a-z0-9])?)", re.IGNORECASE)
+BIND_RE = re.compile(r"MAC_BIND chat=([0-9]{8}-[0-9a-f]{4}) name=([a-z0-9][a-z0-9_-]*)")
+# <harness>-<model>, e.g. claude-opus; hyphens allowed inside, never at the ends.
+NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,30}[a-z0-9])?$")
 TURN_HEADER_RE = re.compile(r"your turn \((\d+)/\d+\)")
 CODEX_WAKER_TIMEOUT_S = 300
 CODEX_QUEUE_RETRY_S = 5
@@ -212,7 +213,7 @@ def add_human(conn, chat, via, text):
     """Insert a human message; @mentions set next_speaker (last one wins)."""
     seq = add_message(conn, chat["id"], "human", "human", via, text)
     names = set(r["name"] for r in roster(conn, chat["id"]))
-    mentioned = [m for m in MENTION_RE.findall(text) if m in names]
+    mentioned = [m.lower() for m in MENTION_RE.findall(text) if m.lower() in names]
     if mentioned:
         conn.execute("UPDATE chats SET next_speaker=? WHERE id=?", (mentioned[-1], chat["id"]))
     return seq

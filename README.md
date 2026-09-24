@@ -21,7 +21,7 @@ While the chat is running:
 | You type (in any session) | Effect |
 |---|---|
 | `what about latency?` | Posted to the chat; the agents see it on their next turn |
-| `@codex your take?` | Posted; codex speaks next, after the current speaker finishes |
+| `@codex-sol your take?` | Posted; codex-sol speaks next, after the current speaker finishes |
 | `// summarize so far` | Private to that agent; not posted |
 | `// end the chat` | That agent ends the chat |
 

@@ -11,11 +11,11 @@ A local group discussion between 2–3 agents and the human, one speaker at a ti
 CHAT="/usr/bin/python3 $HOME/.multi-agent-chat/skill/multi-agent-chat/scripts/chat.py"
 ```
 
-Your participant name is your harness in lowercase: `claude`, `codex` or `opencode` (add a digit if taken). Use `--harness` with the same value.
+Your participant name is `<harness>-<model>` in lowercase, with the model as one short word and no version: `claude-opus`, `claude-fable`, `codex-sol`, `opencode-deepseek`. If you aren't sure of your model, use just the harness (`codex`). If the name is taken, add a digit. Pass `--harness` as `claude`, `codex` or `opencode`.
 
 ## Host: create a chat
 
-1. `$CHAT create --name <you> --harness <you> --topic "<the human's topic, verbatim>"`, adding `--max-turns N` if the human gave a limit. Note the chat id.
+1. `$CHAT create --name <you> --harness <harness> --topic "<the human's topic, verbatim>"`, adding `--max-turns N` if the human gave a limit. Note the chat id.
 2. Gather context from what the human pointed to (files, repos, docs) plus anything obviously related. Read, don't copy.
 3. Write a brief to a temp file and set it: `$CHAT brief --chat <id> --name <you> --file <path>`. Format (under 16 KB):
    ```
@@ -36,7 +36,7 @@ When the turn limit is reached, the chat doesn't end: you get a *limit turn* (th
 
 ## Join a chat
 
-1. `$CHAT join <id> --name <you> --harness <you>` (or `--latest` instead of the id).
+1. `$CHAT join <id> --name <you> --harness <harness>` (or `--latest` instead of the id).
 2. Read the topic and brief it prints. Open referenced files only as needed.
 3. Follow "Waiting" below.
 

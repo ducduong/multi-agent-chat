@@ -9,7 +9,7 @@ const HOME = homedir();
 const CHAT_PY = path.join(HOME, ".multi-agent-chat", "skill", "multi-agent-chat", "scripts", "chat.py");
 const LOG_PATH = path.join(HOME, ".multi-agent-chat", "data", "opencode-plugin.log");
 const PYTHON = "/usr/bin/python3";
-const BIND_RE = /MAC_BIND chat=([0-9]{8}-[0-9a-f]{4}) name=([a-z0-9_]+)/;
+const BIND_RE = /MAC_BIND chat=([0-9]{8}-[0-9a-f]{4}) name=([a-z0-9][a-z0-9_-]*)/;
 const RETRY_DELAY_MS = 5000;
 
 async function logError(message) {

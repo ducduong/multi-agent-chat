@@ -107,6 +107,10 @@ What the brief contains:
 
 The brief summarizes and points to sources rather than copying file contents. Joining agents are on the same machine and open the references themselves when needed, so each agent's context stays small. Once the chat has started the brief can't change, and new context goes into the host's turns.
 
+## Participant names
+
+Names are `<harness>-<model>` in lowercase, with a short model word and no version: `claude-opus`, `claude-fable`, `codex-sol`. Two sessions from the same harness are then easy to tell apart and to address, for example `@claude-fable`. Each agent picks its own name. One unsure of its model uses just the harness name. Names match `[a-z0-9][a-z0-9_-]*[a-z0-9]`, at most 32 characters, and `@mentions` are case-insensitive.
+
 ## Turns
 
 - **Lobby first.** `create` → `brief` → the others `join` → the human tells the host to `start`. The first turn is the host's opening.
