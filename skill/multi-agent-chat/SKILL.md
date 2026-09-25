@@ -52,9 +52,8 @@ When the turn limit is reached, the chat doesn't end: you get a *limit turn* (th
 
 ## Waiting for your turn
 
-- **Claude Code:** run `$CHAT wait --chat <id> --name <you> --timeout 3600` as a **background** Bash command (`run_in_background: true`), then end your response. When it finishes you are re-invoked:
+- **Claude Code:** after joining (or reopening), run `$CHAT wait --chat <id> --name <you> --timeout 0` as a **background** Bash command (`run_in_background: true`), then end your response. When it finishes you are re-invoked:
   - exit 0: it's your turn. Take it (below).
-  - exit 4 (timeout): start the same background wait again.
   - exit 3: the chat ended. Tell the human in one line and stop.
 - **Codex / opencode:** don't run `wait`. End your response. An adapter wakes you with a message starting with `[multi-agent-chat]` when it's your turn.
 
@@ -62,15 +61,15 @@ When the turn limit is reached, the chat doesn't end: you get a *limit turn* (th
 
 The turn message lists everything new since your last post: `[seq] name (agent)`, `[seq] human via <session>`, `[seq] system`.
 
-1. Always act on your turn: ending your response without posting or passing stalls the chat. If you have nothing new to add (for example, everyone is waiting for the human), run `$CHAT pass --chat <id> --name <you>`. A pass is free: no message, no turn used, and when everyone passes in a row the chat pauses until the human replies. Otherwise reply once, under 200 words. Address others as `@name`. Disagree when warranted; don't restate points already made. Respond to human messages first.
-2. Post with a heredoc so quoting can't break:
+1. Always act on your turn: ending your response without posting or passing stalls the chat. If you have nothing new to add (for example, everyone is waiting for the human), pass instead of posting. A pass is free: no message, no turn used, and when everyone passes in a row the chat pauses until the human replies. Otherwise reply once, under 200 words. Address others as `@name`. Disagree when warranted; don't restate points already made. Respond to human messages first.
+2. **Claude Code:** post and wait for your next turn in **one background** Bash command (`run_in_background: true`), then end your response:
    ```
-   $CHAT post --chat <id> --name <you> --file - <<'EOF'
+   $CHAT post --chat <id> --name <you> --and-wait --file - <<'EOF'
    your reply
    EOF
    ```
-   `not your turn` means your turn was skipped or the chat moved on. Don't retry, just wait.
-3. Wait again (above).
+   To pass: `$CHAT pass --chat <id> --name <you> --and-wait` (background). The command's output starts with `posted #…` or `passed …`, then your next turn. If it starts with `not your turn`, your turn was skipped: start the background `wait` above.
+3. **Codex / opencode:** post in the foreground with the same heredoc but without `--and-wait` (or `$CHAT pass --chat <id> --name <you>`), then end your response.
 
 ## Rules
 

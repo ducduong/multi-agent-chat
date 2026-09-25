@@ -465,6 +465,7 @@ def format_turn_text(chat_id, name, chat, messages, next_after):
 
 def wait_for_turn(conn, chat_id, name, timeout, skip_turn):
     """Block until it's `name`'s turn, the chat ends, or `timeout` elapses.
+    timeout == 0 means no timeout (block indefinitely).
 
     `skip_turn`, when set, is a turn number (turns_taken+1) already delivered:
     that turn is not returned again, so a caller re-polling after delivering it
@@ -472,7 +473,7 @@ def wait_for_turn(conn, chat_id, name, timeout, skip_turn):
     Returns (exit_code, text): 0 (turn, text is the turn block), 3 (ended) or
     4 (timed out; text is a one-line status message).
     """
-    deadline = time.time() + timeout
+    deadline = None if timeout == 0 else time.time() + timeout
 
     def check():
         chat = get_chat(conn, chat_id)
@@ -509,9 +510,17 @@ def wait_for_turn(conn, chat_id, name, timeout, skip_turn):
         if kind == "turn":
             chat, messages, next_after = payload
             return 0, format_turn_text(chat_id, name, chat, messages, next_after)
-        if time.time() >= deadline:
+        if deadline is not None and time.time() >= deadline:
             return 4, "[multi-agent-chat] chat %s · wait timed out" % chat_id
         time.sleep(1)
+
+
+def resolve_timeout(timeout_arg, default):
+    if timeout_arg is None:
+        return default
+    if timeout_arg < 0:
+        fail("--timeout must be >= 0")
+    return timeout_arg
 
 
 def set_wait_pid(conn, chat_id, name, pid):
@@ -520,10 +529,26 @@ def set_wait_pid(conn, chat_id, name, pid):
     )
 
 
+def run_and_wait(conn, chat_id, name, timeout, action_fn):
+    """Shared by post/pass --and-wait: sets the wait_pid liveness marker (same one
+    cmd_wait uses, for hook_stop's safety net) before running action_fn (a post or
+    pass; a failure there calls fail()/sys.exit and is left to propagate through the
+    finally below), then waits for the next turn exactly like `wait` would."""
+    with_txn(conn, lambda: set_wait_pid(conn, chat_id, name, os.getpid()))
+    try:
+        action_fn()
+        sys.stdout.flush()
+        code, text = wait_for_turn(conn, chat_id, name, timeout, None)
+        print(text)
+        return code
+    finally:
+        with_txn(conn, lambda: set_wait_pid(conn, chat_id, name, None))
+
+
 def cmd_wait(args, home, conn):
     chat_id = resolve_chat_id(conn, args.chat)
     cfg = get_config(home)
-    timeout = args.timeout if args.timeout is not None else cfg["wait_timeout_s"]
+    timeout = resolve_timeout(args.timeout, cfg["wait_timeout_s"])
     # Liveness marker for hook_stop's safety net: only cmd_wait sets this (not the
     # codex waker, which is a distinct long-lived process the stop hook doesn't track).
     with_txn(conn, lambda: set_wait_pid(conn, chat_id, args.name, os.getpid()))
@@ -546,6 +571,13 @@ def cmd_pass_core(conn, chat_id, chat, name):
 
 def cmd_post(args, home, conn):
     chat_id = resolve_chat_id(conn, args.chat)
+    if args.and_wait:
+        timeout = resolve_timeout(args.timeout, 0)
+        return run_and_wait(conn, chat_id, args.name, timeout, lambda: do_post(args, conn, chat_id))
+    return do_post(args, conn, chat_id)
+
+
+def do_post(args, conn, chat_id):
     text = read_text_arg(args.text, args.file)
 
     def txn():
@@ -602,7 +634,13 @@ def cmd_post(args, home, conn):
 
 def cmd_pass(args, home, conn):
     chat_id = resolve_chat_id(conn, args.chat)
+    if args.and_wait:
+        timeout = resolve_timeout(args.timeout, 0)
+        return run_and_wait(conn, chat_id, args.name, timeout, lambda: do_pass(args, conn, chat_id))
+    return do_pass(args, conn, chat_id)
 
+
+def do_pass(args, conn, chat_id):
     def txn():
         chat = get_chat(conn, chat_id)
         if chat is None:
@@ -1079,6 +1117,11 @@ def hook_stop(harness, data, home):
     # while paused there is no live turn to reply to, so the speaker check doesn't
     # apply -- only the no-live-wait check below, so a paused chat can still wake claude.
     if chat["status"] == "active" and chat["speaker"] == name:
+        # A live wait_pid means a background post/pass --and-wait is already in flight
+        # (or a plain wait that will wake this agent immediately) -- only claude ever
+        # sets wait_pid, so this check never delays codex's Stop handling.
+        if harness == "claude" and wait_is_running(conn, chat_id, name):
+            return emit_pass(harness)
         reason = (
             "[multi-agent-chat] It is still your turn in chat %s. Post your reply now: "
             "python3 %s post --chat %s --name %s --file - <<'EOF' ... EOF "
@@ -1086,10 +1129,13 @@ def hook_stop(harness, data, home):
             % (chat_id, script_path, chat_id, name, script_path, chat_id, name)
         )
         if harness == "claude":
-            reason += (
-                " Then start the background wait again: "
-                "python3 %s wait --chat %s --name %s --timeout 3600 (run_in_background)."
-                % (script_path, chat_id, name)
+            reason = (
+                "[multi-agent-chat] It is still your turn in chat %s. Post your reply now, as "
+                "one background command: python3 %s post --chat %s --name %s --and-wait "
+                "--file - <<'EOF' ... EOF (run_in_background: true). Or, if you have nothing "
+                "new to add: python3 %s pass --chat %s --name %s --and-wait "
+                "(run_in_background: true)."
+                % (chat_id, script_path, chat_id, name, script_path, chat_id, name)
             )
         return emit_block(harness, reason)
 
@@ -1097,7 +1143,7 @@ def hook_stop(harness, data, home):
         reason = (
             "[multi-agent-chat] You are in chat %s and no wait is running, so you will "
             "never be woken for your turn. Start it now as a background command: "
-            "python3 %s wait --chat %s --name %s --timeout 3600 (run_in_background: true), "
+            "python3 %s wait --chat %s --name %s --timeout 0 (run_in_background: true), "
             "then end your response." % (chat_id, script_path, chat_id, name)
         )
         return emit_block(harness, reason)
@@ -1150,11 +1196,15 @@ def build_parser():
     po.add_argument("--name", required=True)
     po.add_argument("text", nargs="?", default=None)
     po.add_argument("--file", default=None)
+    po.add_argument("--and-wait", action="store_true", dest="and_wait")
+    po.add_argument("--timeout", type=float, default=None)
     po.set_defaults(func=cmd_post)
 
     pa = sub.add_parser("pass")
     pa.add_argument("--chat", default=None)
     pa.add_argument("--name", required=True)
+    pa.add_argument("--and-wait", action="store_true", dest="and_wait")
+    pa.add_argument("--timeout", type=float, default=None)
     pa.set_defaults(func=cmd_pass)
 
     e = sub.add_parser("end")

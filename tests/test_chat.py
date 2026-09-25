@@ -608,6 +608,124 @@ class TestTimeout(ChatTestCase):
         r = self.wait(chat_id, "codex", timeout=2)
         self.assertEqual(r.returncode, 3)
 
+    def test_wait_timeout_zero_blocks_until_turn(self):
+        chat_id = self.setup_three_way_chat()  # speaker is claude
+        proc = subprocess.Popen(
+            [PY, SCRIPT, "wait", "--chat", chat_id, "--name", "codex", "--timeout", "0"],
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            time.sleep(1.5)
+            self.assertIsNone(proc.poll())  # no timeout ever fires
+            self.post(chat_id, "claude", "go ahead")  # advances turn to codex
+            stdout, _ = proc.communicate(timeout=5)
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn("your turn", stdout)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)
+
+    def test_wait_negative_timeout_rejected(self):
+        chat_id = self.setup_three_way_chat()
+        r = self.run_cmd(["wait", "--chat", chat_id, "--name", "codex", "--timeout", "-1"])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--timeout must be >= 0", r.stderr)
+
+
+class TestAndWait(ChatTestCase):
+    def test_post_and_wait_delivers_next_turn(self):
+        chat_id = self.setup_two_way_chat()  # speaker is claude
+        proc = subprocess.Popen(
+            [PY, SCRIPT, "post", "--chat", chat_id, "--name", "claude", "--and-wait",
+             "--timeout", "5", "hello from claude"],
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                rows = self.query(
+                    "SELECT COUNT(*) FROM messages WHERE chat_id=? AND kind='agent'", (chat_id,)
+                )
+                if rows[0][0] >= 1:
+                    break
+                time.sleep(0.1)
+            r = self.post(chat_id, "codex", "hello back")
+            self.assertEqual(r.returncode, 0)
+            stdout, stderr = proc.communicate(timeout=10)
+            self.assertEqual(proc.returncode, 0, stderr)
+            self.assertIn("posted #", stdout)
+            self.assertIn("your turn", stdout)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)
+
+    def test_post_and_wait_not_your_turn_exits_immediately(self):
+        chat_id = self.setup_three_way_chat()  # speaker is claude
+        start = time.time()
+        r = self.run_cmd(["post", "--chat", chat_id, "--name", "codex", "--and-wait", "not my turn"])
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("not your turn", r.stderr)
+        self.assertLess(time.time() - start, 3)
+
+    def test_post_and_wait_sets_and_clears_wait_pid(self):
+        # SIGTERM would skip the finally that clears wait_pid, so this lets the
+        # process exit on its own via --timeout rather than killing it.
+        chat_id = self.setup_two_way_chat()  # speaker is claude
+        proc = subprocess.Popen(
+            [PY, SCRIPT, "post", "--chat", chat_id, "--name", "claude", "--and-wait",
+             "--timeout", "2", "hello"],
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            deadline = time.time() + 3
+            pid = None
+            while time.time() < deadline:
+                rows = self.query(
+                    "SELECT wait_pid FROM participants WHERE chat_id=? AND name='claude'", (chat_id,)
+                )
+                if rows and rows[0][0] is not None:
+                    pid = rows[0][0]
+                    break
+                time.sleep(0.1)
+            self.assertEqual(pid, proc.pid)
+            proc.communicate(timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)
+
+        rows = self.query(
+            "SELECT wait_pid FROM participants WHERE chat_id=? AND name='claude'", (chat_id,)
+        )
+        self.assertIsNone(rows[0][0])
+
+    def test_pass_and_wait_works(self):
+        chat_id = self.setup_two_way_chat()  # speaker is claude
+        proc = subprocess.Popen(
+            [PY, SCRIPT, "pass", "--chat", chat_id, "--name", "claude", "--and-wait",
+             "--timeout", "5"],
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                row = self.query("SELECT speaker FROM chats WHERE id=?", (chat_id,))[0]
+                if row[0] == "codex":
+                    break
+                time.sleep(0.1)
+            r = self.post(chat_id, "codex", "hi")
+            self.assertEqual(r.returncode, 0)
+            stdout, stderr = proc.communicate(timeout=10)
+            self.assertEqual(proc.returncode, 0, stderr)
+            self.assertIn("passed", stdout)
+            self.assertIn("your turn", stdout)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)
+
 
 class TestDelivery(ChatTestCase):
     def test_message_after_wait_delivered_next_turn(self):
@@ -983,7 +1101,20 @@ class TestStopHook(ChatTestCase):
         data = json.loads(r.stdout)
         self.assertEqual(data["decision"], "block")
         self.assertIn("still your turn", data["reason"])
-        self.assertIn("wait", data["reason"])
+        self.assertIn("--and-wait", data["reason"])
+
+    def test_speaker_is_me_with_live_wait_pid_passes(self):
+        chat_id = self.setup_three_way_chat()  # speaker is claude
+        self.bind("claude", "s1", chat_id, "claude")
+        helper = subprocess.Popen([PY, "-c", "import time; time.sleep(5)"])
+        try:
+            self.set_wait_pid(chat_id, "claude", helper.pid)
+            r = self.stop_hook("claude", "s1")
+            self.assertEqual(r.returncode, 0)
+            self.assertEqual(r.stdout, "")
+        finally:
+            helper.terminate()
+            helper.wait(timeout=5)
 
     def test_speaker_is_me_blocks_and_codex_does_not_mention_wait(self):
         chat_id = self.create_chat(name="codex", topic="t")
