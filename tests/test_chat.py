@@ -86,6 +86,9 @@ class ChatTestCase(unittest.TestCase):
     def post(self, chat_id, name, text):
         return self.run_cmd(["post", "--chat", chat_id, "--name", name, text])
 
+    def pass_turn(self, chat_id, name):
+        return self.run_cmd(["pass", "--chat", chat_id, "--name", name])
+
     def wait(self, chat_id, name, timeout=2):
         return self.run_cmd(["wait", "--chat", chat_id, "--name", name, "--timeout", str(timeout)])
 
@@ -136,6 +139,12 @@ class ChatTestCase(unittest.TestCase):
         chat_id = self.create_chat(name="claude", topic="t", max_turns=max_turns)
         self.join(chat_id, "codex")
         self.join(chat_id, "opencode")
+        self.start(chat_id, "claude")
+        return chat_id
+
+    def setup_two_way_chat(self, max_turns=12):
+        chat_id = self.create_chat(name="claude", topic="t", max_turns=max_turns)
+        self.join(chat_id, "codex")
         self.start(chat_id, "claude")
         return chat_id
 
@@ -352,8 +361,183 @@ class TestExtend(ChatTestCase):
         self.assertIn("next: codex", r2.stdout)  # rotation resumes normally after the host's turn
 
 
+class TestPass(ChatTestCase):
+    def test_pass_stores_no_message_and_advances_rotation(self):
+        chat_id = self.setup_three_way_chat(max_turns=12)
+        before = self.query("SELECT COUNT(*) FROM messages WHERE chat_id=?", (chat_id,))[0][0]
+
+        r = self.pass_turn(chat_id, "claude")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("passed · next: codex", r.stdout)
+
+        after = self.query("SELECT COUNT(*) FROM messages WHERE chat_id=?", (chat_id,))[0][0]
+        self.assertEqual(after, before)
+        row = self.query("SELECT turns_taken, speaker FROM chats WHERE id=?", (chat_id,))[0]
+        self.assertEqual(row[0], 0)
+        self.assertEqual(row[1], "codex")
+
+    def test_pass_advances_read_seq_to_shown_seq(self):
+        chat_id = self.setup_three_way_chat(max_turns=12)
+        self.wait(chat_id, "claude", timeout=1)  # sets shown_seq to the current max
+        self.pass_turn(chat_id, "claude")
+        rows = self.query(
+            "SELECT shown_seq, read_seq FROM participants WHERE chat_id=? AND name='claude'",
+            (chat_id,),
+        )
+        self.assertEqual(rows[0][0], rows[0][1])
+
+    def test_non_speaker_pass_rejected(self):
+        chat_id = self.setup_three_way_chat(max_turns=12)
+        r = self.pass_turn(chat_id, "codex")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("not your turn", r.stderr)
+
+    def test_pass_at_limit_rejected(self):
+        chat_id = self.setup_three_way_chat(max_turns=2)
+        self.post(chat_id, "claude", "a")
+        self.post(chat_id, "codex", "b")  # at limit; speaker=claude (host)
+        r = self.pass_turn(chat_id, "claude")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("turn limit reached", r.stderr)
+
+
+class TestPassCompat(ChatTestCase):
+    def test_short_pass_prefixed_post_behaves_as_pass(self):
+        chat_id = self.setup_three_way_chat(max_turns=12)
+        r = self.post(chat_id, "claude", "pass — nothing to add")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("passed · next: codex", r.stdout)
+        rows = self.query(
+            "SELECT COUNT(*) FROM messages WHERE chat_id=? AND kind='agent'", (chat_id,)
+        )
+        self.assertEqual(rows[0][0], 0)
+
+    def test_long_pass_prefixed_post_is_a_real_post(self):
+        chat_id = self.setup_three_way_chat(max_turns=12)
+        text = "pass the config through the env and update the readme accordingly please"
+        self.assertGreater(len(text), 60)
+        r = self.post(chat_id, "claude", text)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("posted #", r.stdout)
+        rows = self.query(
+            "SELECT text FROM messages WHERE chat_id=? AND kind='agent'", (chat_id,)
+        )
+        self.assertEqual(rows, [(text,)])
+
+    def test_real_post_resets_passes(self):
+        chat_id = self.setup_three_way_chat(max_turns=12)
+        self.pass_turn(chat_id, "claude")  # passes=1, speaker=codex
+        self.post(chat_id, "codex", "hello")  # real post resets passes
+        row = self.query("SELECT passes FROM chats WHERE id=?", (chat_id,))[0]
+        self.assertEqual(row[0], 0)
+
+
+class TestPauseFlow(ChatTestCase):
+    def test_two_consecutive_passes_pause_with_a_single_system_message(self):
+        chat_id = self.setup_two_way_chat(max_turns=12)
+        self.pass_turn(chat_id, "claude")
+        r = self.pass_turn(chat_id, "codex")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("passed · chat paused until the human replies", r.stdout)
+
+        st = self.run_cmd(["status", "--chat", chat_id], check=True)
+        self.assertIn("status: paused (waiting for the human)", st.stdout)
+        tail = self.run_cmd(["tail", "--chat", chat_id], check=True)
+        self.assertEqual(tail.stdout.count("everyone passed"), 1)
+
+    def test_wait_times_out_for_either_agent_while_paused(self):
+        chat_id = self.setup_two_way_chat(max_turns=12)
+        self.pass_turn(chat_id, "claude")
+        self.pass_turn(chat_id, "codex")
+        r1 = self.wait(chat_id, "claude", timeout=1)
+        self.assertEqual(r1.returncode, 4)
+        r2 = self.wait(chat_id, "codex", timeout=1)
+        self.assertEqual(r2.returncode, 4)
+
+
+class TestPauseResume(ChatTestCase):
+    def pause_three_way(self, chat_id):
+        self.pass_turn(chat_id, "claude")
+        self.pass_turn(chat_id, "codex")
+        self.pass_turn(chat_id, "opencode")  # 3 passes == 3 participants -> paused, speaker=claude
+
+    def test_human_relay_while_paused_resumes_next_in_line_speaker(self):
+        chat_id = self.setup_three_way_chat(max_turns=12)
+        self.pause_three_way(chat_id)
+
+        self.bind("claude", "s1", chat_id, "claude")
+        r = self.relay("claude", "s1", "let's continue")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["decision"], "block")
+        self.assertIn("posted to chat", data["reason"])
+
+        st = self.run_cmd(["status", "--chat", chat_id], check=True)
+        self.assertIn("status: active", st.stdout)
+        self.assertIn("speaker: claude", st.stdout)  # next-in-line after opencode's pass
+
+        row = self.query("SELECT passes FROM chats WHERE id=?", (chat_id,))[0]
+        self.assertEqual(row[0], 0)
+
+        w = self.wait(chat_id, "claude", timeout=2)
+        self.assertEqual(w.returncode, 0)
+        self.assertIn("let's continue", w.stdout)
+
+    def test_human_relay_with_mention_resumes_mentioned_agent(self):
+        chat_id = self.setup_three_way_chat(max_turns=12)
+        self.pause_three_way(chat_id)
+
+        self.bind("claude", "s1", chat_id, "claude")
+        self.relay("claude", "s1", "@codex please take over")
+
+        st = self.run_cmd(["status", "--chat", chat_id], check=True)
+        self.assertIn("status: active", st.stdout)
+        self.assertIn("speaker: codex", st.stdout)
+
+    def test_human_message_while_active_resets_passes(self):
+        chat_id = self.setup_two_way_chat(max_turns=12)
+        self.pass_turn(chat_id, "claude")  # passes=1, speaker=codex
+
+        self.bind("claude", "s1", chat_id, "claude")
+        self.relay("claude", "s1", "just a note")  # resets passes while still active
+
+        row = self.query("SELECT passes FROM chats WHERE id=?", (chat_id,))[0]
+        self.assertEqual(row[0], 0)
+
+        r = self.pass_turn(chat_id, "codex")  # passes=1 again, not the full round
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("passed · next: claude", r.stdout)
+        st = self.run_cmd(["status", "--chat", chat_id], check=True)
+        self.assertIn("status: active", st.stdout)
+
+
+class TestPausedControls(ChatTestCase):
+    def pause_three_way(self, chat_id):
+        self.pass_turn(chat_id, "claude")
+        self.pass_turn(chat_id, "codex")
+        self.pass_turn(chat_id, "opencode")
+
+    def test_extend_works_while_paused(self):
+        chat_id = self.setup_three_way_chat(max_turns=12)
+        self.pause_three_way(chat_id)
+        r = self.run_cmd(
+            ["extend", "--chat", chat_id, "--name", "claude", "--turns", "3"], check=True
+        )
+        self.assertIn("extended", r.stdout)
+        st = self.run_cmd(["status", "--chat", chat_id], check=True)
+        self.assertIn("status: paused", st.stdout)
+
+    def test_end_works_while_paused(self):
+        chat_id = self.setup_three_way_chat(max_turns=12)
+        self.pause_three_way(chat_id)
+        r = self.run_cmd(["end", "--chat", chat_id, "--name", "claude"], check=True)
+        self.assertIn("ended", r.stdout)
+        st = self.run_cmd(["status", "--chat", chat_id], check=True)
+        self.assertIn("status: ended", st.stdout)
+
+
 class TestTimeout(ChatTestCase):
-    def test_timeout_skip_counts_turn_and_does_not_advance_read_seq(self):
+    def test_timeout_skip_does_not_count_turn_and_does_not_advance_read_seq(self):
         self.write_config(max_turns=12, turn_timeout_s=1, wait_timeout_s=5)
         chat_id = self.setup_three_way_chat()
         import time
@@ -362,7 +546,7 @@ class TestTimeout(ChatTestCase):
         # any command triggers the lazy timeout check
         st = self.run_cmd(["status", "--chat", chat_id], check=True)
         self.assertIn("speaker: codex", st.stdout)
-        self.assertIn("turns: 1/12", st.stdout)
+        self.assertIn("turns: 0/12", st.stdout)  # a skip is a free pass, not a turn
 
         tail = self.run_cmd(["tail", "--chat", chat_id], check=True)
         self.assertIn("skipped claude (no reply in 1s)", tail.stdout)
@@ -372,23 +556,42 @@ class TestTimeout(ChatTestCase):
         )
         self.assertEqual(rows[0][0], 0)
 
-    def test_timeout_skip_reaching_limit_then_no_further_skip(self):
-        self.write_config(max_turns=2, turn_timeout_s=1, wait_timeout_s=5)
-        chat_id = self.setup_three_way_chat(max_turns=2)
-        self.post(chat_id, "claude", "a")  # turns_taken=1, speaker=codex
+        row = self.query("SELECT passes FROM chats WHERE id=?", (chat_id,))[0]
+        self.assertEqual(row[0], 1)
 
-        time.sleep(1.5)
-        st = self.run_cmd(["status", "--chat", chat_id], check=True)  # skip pushes turns_taken to the limit
-        self.assertIn("status: active", st.stdout)
-        self.assertIn("speaker: claude", st.stdout)
-        self.assertIn("turns: 2/2 (at limit", st.stdout)
+    def test_repeated_skips_never_reach_turn_limit_but_eventually_pause(self):
+        self.write_config(max_turns=1, turn_timeout_s=1, wait_timeout_s=5)
+        chat_id = self.setup_three_way_chat(max_turns=1)
 
-        time.sleep(1.5)  # would be another overdue turn if the timeout still applied
-        st2 = self.run_cmd(["status", "--chat", chat_id], check=True)
-        self.assertIn("speaker: claude", st2.stdout)
-        self.assertIn("turns: 2/2 (at limit", st2.stdout)
+        time.sleep(1.5)  # skip 1/3: claude -> codex
+        st = self.run_cmd(["status", "--chat", chat_id], check=True)
+        self.assertIn("turns: 0/1", st.stdout)
+
+        time.sleep(1.5)  # skip 2/3: codex -> opencode
+        st = self.run_cmd(["status", "--chat", chat_id], check=True)
+        self.assertIn("turns: 0/1", st.stdout)
+
+        time.sleep(1.5)  # skip 3/3 == participant count -> paused, never the turn limit
+        st = self.run_cmd(["status", "--chat", chat_id], check=True)
+        self.assertIn("status: paused", st.stdout)
+
         tail = self.run_cmd(["tail", "--chat", chat_id], check=True)
-        self.assertEqual(tail.stdout.count("skipped"), 1)
+        self.assertEqual(tail.stdout.count("skipped"), 3)
+        self.assertIn("everyone passed", tail.stdout)
+
+    def test_skip_plus_pass_in_two_agent_chat_pauses(self):
+        self.write_config(max_turns=12, turn_timeout_s=1, wait_timeout_s=5)
+        chat_id = self.setup_two_way_chat()
+
+        time.sleep(1.5)  # skip: claude -> codex, passes=1
+        st = self.run_cmd(["status", "--chat", chat_id], check=True)
+        self.assertIn("speaker: codex", st.stdout)
+
+        r = self.pass_turn(chat_id, "codex")  # passes=2 == participant count -> paused
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("chat paused", r.stdout)
+        st2 = self.run_cmd(["status", "--chat", chat_id], check=True)
+        self.assertIn("status: paused", st2.stdout)
 
     def test_wait_exit_codes(self):
         self.write_config(max_turns=12, turn_timeout_s=600, wait_timeout_s=5)
@@ -835,6 +1038,33 @@ class TestStopHook(ChatTestCase):
         r = self.stop_hook("codex", "s1")
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout, "")
+
+    def test_paused_claude_without_live_wait_blocks(self):
+        chat_id = self.setup_three_way_chat()
+        self.pass_turn(chat_id, "claude")
+        self.pass_turn(chat_id, "codex")
+        self.pass_turn(chat_id, "opencode")  # paused, speaker (next-in-line) = claude
+        self.bind("claude", "s1", chat_id, "claude")
+        r = self.stop_hook("claude", "s1")
+        data = json.loads(r.stdout)
+        self.assertEqual(data["decision"], "block")
+        self.assertIn("no wait is running", data["reason"])
+
+    def test_paused_claude_with_live_wait_passes(self):
+        chat_id = self.setup_three_way_chat()
+        self.pass_turn(chat_id, "claude")
+        self.pass_turn(chat_id, "codex")
+        self.pass_turn(chat_id, "opencode")  # paused, speaker (next-in-line) = claude
+        self.bind("claude", "s1", chat_id, "claude")
+        helper = subprocess.Popen([PY, "-c", "import time; time.sleep(5)"])
+        try:
+            self.set_wait_pid(chat_id, "claude", helper.pid)
+            r = self.stop_hook("claude", "s1")
+            self.assertEqual(r.returncode, 0)
+            self.assertEqual(r.stdout, "")
+        finally:
+            helper.terminate()
+            helper.wait(timeout=5)
 
 
 class TestRejoin(ChatTestCase):

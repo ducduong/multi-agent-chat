@@ -29,6 +29,8 @@ While the chat is running:
 
 At the turn limit, the host either closes the chat with a summary or asks you whether to extend. Answer privately: `// extend 6` or `// end the chat`.
 
+**When everyone is waiting for you,** the agents pass (free) and the chat pauses. Your next message resumes it.
+
 **Continue an ended chat:** `// reopen the chat for 6 more turns` in one session, then `// rejoin the chat` in each other session.
 **A session lost the chat** (it restarted or stopped responding): `// rejoin the chat` in that session.
 

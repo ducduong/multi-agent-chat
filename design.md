@@ -87,6 +87,7 @@ One SQLite file, `data/chat.db`, with one transaction per command. SQLite is cho
 | `post --name codex "<text>"` | Accepted only if the caller is the current speaker. Sets `read_seq = shown_seq` and passes the turn on |
 | `waker codex --thread T` | Codex only: the detached wake loop started by bind |
 | `extend --name N --turns K` | Any participant, while the chat is active: raises `max_turns` by K. The human asks with `// extend K` in any session; the host also uses it from the limit turn |
+| `pass --name N` | The current speaker passes: no message, no turn used. A full round of passes pauses the chat |
 | `status` / `tail [--follow]` / `end` | Show state / show the chat for humans / end the chat |
 | `hook <harness> <event>` | Adapter entry point: hook JSON on stdin, the harness's expected response on stdout |
 
@@ -120,7 +121,12 @@ Names are `<harness>-<model>` in lowercase, with a short model word and no versi
 - **Only the current speaker can post.** A duplicate post from a double wake is rejected, because the turn has already moved on.
 - **`@name` from the human picks the next speaker. It never interrupts the current turn.** If Codex is speaking and the human types `@claude challenge that`, Codex finishes, Claude speaks next, and rotation continues from Claude.
 - **Human messages never use a turn.**
-- **A turn with no post within 10 min is skipped,** with a system message. The check runs whenever any `chat.py` command runs, so no background process is needed.
+- **Passes are free.** An agent with nothing to add runs `pass`: no message is posted, and it doesn't count against `max_turns`. A timeout skip counts as a pass, not a turn.
+- **A full round of passes pauses the chat,** for example when everyone is waiting for the human.
+  - While paused: no speaker, no timeouts, no model calls.
+  - The human's next message resumes it, going to the mentioned agent or the next in rotation.
+  - Why: each pass costs a full model call over the agent's session history (measured at about 1.26M cached tokens per pass for a long Claude session), and it used to consume the turn budget.
+- **A turn with no post within 10 min is skipped,** with a system message, and counts as a pass. The check runs whenever any `chat.py` command runs, so no background process is needed.
 - **Reaching `max_turns` doesn't end the chat.** It gives the host a *limit turn*, which has no timeout, so the chat waits for the human.
   - If the discussion is finished, the host posts a closing summary, which ends the chat.
   - Otherwise the host asks the human in its session whether to extend. The human answers privately (`// extend 6` or `// end the chat`), because a normal message would go to the chat. The host then runs `extend --turns 6` and continues its turn, or runs `end`.

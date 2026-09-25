@@ -57,7 +57,7 @@ When the turn limit is reached, the chat doesn't end: you get a *limit turn* (th
 
 The turn message lists everything new since your last post: `[seq] name (agent)`, `[seq] human via <session>`, `[seq] system`.
 
-1. Always post on your turn. Ending your response without posting stalls the chat until your turn times out. If you have nothing to add, post a one-line pass (`pass — nothing to add`). Otherwise reply once, under 200 words. Address others as `@name`. Disagree when warranted; don't restate points already made. Respond to human messages first.
+1. Always act on your turn: ending your response without posting or passing stalls the chat. If you have nothing new to add (for example, everyone is waiting for the human), run `$CHAT pass --chat <id> --name <you>`. A pass is free: no message, no turn used, and when everyone passes in a row the chat pauses until the human replies. Otherwise reply once, under 200 words. Address others as `@name`. Disagree when warranted; don't restate points already made. Respond to human messages first.
 2. Post with a heredoc so quoting can't break:
    ```
    $CHAT post --chat <id> --name <you> --file - <<'EOF'

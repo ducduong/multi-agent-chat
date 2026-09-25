@@ -58,6 +58,14 @@ def init_schema(conn):
         turns_taken INTEGER, max_turns INTEGER, turn_timeout_s INTEGER, created_at REAL
     )"""
     )
+    try:
+        # passes: consecutive passes/skips since the last real post; reaching the
+        # participant count pauses the chat (see pass_and_advance). Added via ALTER
+        # rather than the CREATE TABLE above because existing DBs predate this column.
+        conn.execute("ALTER TABLE chats ADD COLUMN passes INTEGER DEFAULT 0")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
     conn.execute(
         """CREATE TABLE IF NOT EXISTS participants (
         chat_id TEXT, name TEXT, harness TEXT, position INTEGER,
@@ -197,9 +205,43 @@ def bump_turns_taken(conn, chat_id, chat):
     return False
 
 
+def pause_chat(conn, chat_id, chat, current_speaker):
+    """A full round of passes/skips: park the chat for the human. speaker is set to
+    the next-in-line (computed the same way advance_turn would) so a plain human
+    reply with no @mention resumes the right agent; next_speaker is left alone."""
+    next_speaker = pick_next_speaker(conn, chat_id, current_speaker, chat["next_speaker"])
+    conn.execute("UPDATE chats SET status='paused', speaker=? WHERE id=?", (next_speaker, chat_id))
+    add_system_message(conn, chat_id, "everyone passed · paused until the human replies")
+    return next_speaker
+
+
+def pass_and_advance(conn, chat_id, chat, speaker):
+    """Increments `passes` and either pauses the chat (a full round of passes) or
+    advances the turn like a post would. Shared by `pass`, post's pass-compatibility
+    path, and timeout skips; those differ only in whether read_seq is touched
+    (see apply_pass). Returns (next_speaker, paused)."""
+    passes = chat["passes"] + 1
+    conn.execute("UPDATE chats SET passes=? WHERE id=?", (passes, chat_id))
+    if passes >= len(roster(conn, chat_id)):
+        return pause_chat(conn, chat_id, chat, speaker), True
+    return advance_turn(conn, chat_id, speaker, chat["next_speaker"]), False
+
+
+def apply_pass(conn, chat_id, chat, name):
+    """A real pass (the `pass` command, or post's pass-compatibility path): unlike a
+    timeout skip, the speaker saw everything shown to it."""
+    participant = get_participant(conn, chat_id, name)
+    conn.execute(
+        "UPDATE participants SET read_seq=? WHERE chat_id=? AND name=?",
+        (participant["shown_seq"], chat_id, name),
+    )
+    return pass_and_advance(conn, chat_id, chat, name)
+
+
 def check_and_apply_timeout(conn, chat):
     """Lazy per-command check: skip a stalled turn once, if overdue.
-    At limit, the chat waits for the host indefinitely; the timeout never fires."""
+    A skip is a free pass: it never advances turns_taken, so an absent agent can't
+    push the chat to the turn limit by timing out repeatedly."""
     if chat is None or chat["status"] != "active" or chat["turn_started_at"] is None:
         return chat
     if chat["turns_taken"] >= chat["max_turns"]:
@@ -210,19 +252,31 @@ def check_and_apply_timeout(conn, chat):
     add_system_message(
         conn, chat["id"], "skipped %s (no reply in %ds)" % (speaker, chat["turn_timeout_s"])
     )
-    at_limit = bump_turns_taken(conn, chat["id"], chat)
-    if not at_limit:
-        advance_turn(conn, chat["id"], speaker, chat["next_speaker"])
+    pass_and_advance(conn, chat["id"], chat, speaker)
     return get_chat(conn, chat["id"])
 
 
 def add_human(conn, chat, via, text):
-    """Insert a human message; @mentions set next_speaker (last one wins)."""
+    """Insert a human message; @mentions set next_speaker (last one wins) while
+    active, or pick the resumed speaker directly while paused. Any human message
+    resets passes, since it breaks the pass round."""
     seq = add_message(conn, chat["id"], "human", "human", via, text)
+    conn.execute("UPDATE chats SET passes=0 WHERE id=?", (chat["id"],))
     names = set(r["name"] for r in roster(conn, chat["id"]))
     mentioned = [m.lower() for m in MENTION_RE.findall(text) if m.lower() in names]
-    if mentioned:
-        conn.execute("UPDATE chats SET next_speaker=? WHERE id=?", (mentioned[-1], chat["id"]))
+    last_mention = mentioned[-1] if mentioned else None
+    if chat["status"] == "paused":
+        # speaker already holds the next-in-line agent (set when the chat paused);
+        # a mention overrides it, otherwise that agent resumes.
+        speaker = last_mention or chat["speaker"]
+        conn.execute(
+            "UPDATE chats SET status='active', speaker=?, next_speaker=NULL, turn_started_at=? "
+            "WHERE id=?",
+            (speaker, time.time(), chat["id"]),
+        )
+        add_system_message(conn, chat["id"], "resumed by the human")
+    elif last_mention:
+        conn.execute("UPDATE chats SET next_speaker=? WHERE id=?", (last_mention, chat["id"]))
     return seq
 
 
@@ -481,6 +535,15 @@ def cmd_wait(args, home, conn):
     return code
 
 
+def cmd_pass_core(conn, chat_id, chat, name):
+    """Shared by the `pass` command and post's pass-compatibility path. Caller must
+    have already confirmed the chat is active and speaker == name."""
+    if chat["turns_taken"] >= chat["max_turns"]:
+        # at limit only the host acts, and only by closing or extending.
+        fail("turn limit reached — host must close or extend", code=2)
+    return apply_pass(conn, chat_id, chat, name)
+
+
 def cmd_post(args, home, conn):
     chat_id = resolve_chat_id(conn, args.chat)
     text = read_text_arg(args.text, args.file)
@@ -494,6 +557,14 @@ def cmd_post(args, home, conn):
             fail("chat is not active", code=2)
         if chat["speaker"] != args.name:
             fail("not your turn (speaker: %s)" % chat["speaker"], code=2)
+
+        stripped = text.strip()
+        if len(stripped) <= 60 and stripped.lower().startswith("pass"):
+            # older skill versions still post the literal word "pass"; treat it as
+            # a free pass instead of spending a turn on it.
+            next_speaker, paused = cmd_pass_core(conn, chat_id, chat, args.name)
+            return "pass", next_speaker, paused
+
         at_limit = chat["turns_taken"] >= chat["max_turns"]
         participant = get_participant(conn, chat_id, args.name)
         seq = add_message(conn, chat_id, args.name, "agent", None, text)
@@ -501,22 +572,53 @@ def cmd_post(args, home, conn):
             "UPDATE participants SET read_seq=? WHERE chat_id=? AND name=?",
             (participant["shown_seq"], chat_id, args.name),
         )
+        conn.execute("UPDATE chats SET passes=0 WHERE id=?", (chat_id,))
         if at_limit:
             # host's post while at limit is the close-or-continue decision: it always ends the chat.
             conn.execute("UPDATE chats SET status='ended' WHERE id=?", (chat_id,))
             add_system_message(conn, chat_id, "chat closed by %s" % args.name)
-            return seq, None, True
+            return "post", seq, None, True
         new_at_limit = bump_turns_taken(conn, chat_id, chat)
         if new_at_limit:
-            return seq, chat["host"], False
+            return "post", seq, chat["host"], False
         new_speaker = advance_turn(conn, chat_id, args.name, chat["next_speaker"])
-        return seq, new_speaker, False
+        return "post", seq, new_speaker, False
 
-    seq, new_speaker, ended = with_txn(conn, txn)
-    if ended:
-        print("posted #%d · chat ended" % seq)
+    result = with_txn(conn, txn)
+    if result[0] == "pass":
+        _, next_speaker, paused = result
+        if paused:
+            print("passed · chat paused until the human replies")
+        else:
+            print("passed · next: %s" % next_speaker)
     else:
-        print("posted #%d · next: %s" % (seq, new_speaker))
+        _, seq, new_speaker, ended = result
+        if ended:
+            print("posted #%d · chat ended" % seq)
+        else:
+            print("posted #%d · next: %s" % (seq, new_speaker))
+    return 0
+
+
+def cmd_pass(args, home, conn):
+    chat_id = resolve_chat_id(conn, args.chat)
+
+    def txn():
+        chat = get_chat(conn, chat_id)
+        if chat is None:
+            fail("chat %s not found" % chat_id)
+        chat = check_and_apply_timeout(conn, chat)
+        if chat["status"] != "active":
+            fail("chat is not active", code=2)
+        if chat["speaker"] != args.name:
+            fail("not your turn (speaker: %s)" % chat["speaker"], code=2)
+        return cmd_pass_core(conn, chat_id, chat, args.name)
+
+    next_speaker, paused = with_txn(conn, txn)
+    if paused:
+        print("passed · chat paused until the human replies")
+    else:
+        print("passed · next: %s" % next_speaker)
     return 0
 
 
@@ -578,7 +680,7 @@ def cmd_extend(args, home, conn):
         chat = check_and_apply_timeout(conn, chat)
         if get_participant(conn, chat_id, args.name) is None:
             fail("%s is not a participant in chat %s" % (args.name, chat_id))
-        if chat["status"] != "active":
+        if chat["status"] not in ("active", "paused"):
             fail("chat is not active")
         at_limit = chat["turns_taken"] >= chat["max_turns"]
         new_max = chat["max_turns"] + args.turns
@@ -610,7 +712,10 @@ def cmd_status(args, home, conn):
     chat = with_txn(conn, txn)
     print("id: %s" % chat["id"])
     print("topic: %s" % chat["topic"])
-    print("status: %s" % chat["status"])
+    if chat["status"] == "paused":
+        print("status: paused (waiting for the human)")
+    else:
+        print("status: %s" % chat["status"])
     print("roster: %s" % ", ".join(r["name"] for r in roster(conn, chat_id)))
     print("speaker: %s" % chat["speaker"])
     at_limit = chat["status"] == "active" and chat["turns_taken"] >= chat["max_turns"]
@@ -874,9 +979,10 @@ def hook_relay(harness, data, home):
     chat_id, name = session["chat_id"], session["name"]
     try:
         chat = get_chat(conn, chat_id)  # None (chat row missing) falls through to the except below
-        if chat["status"] != "active":
+        if chat["status"] not in ("active", "paused"):
             # lobby: the human is setting up the chat with the host, e.g. "start the chat" —
-            # that must reach the host normally, not be posted or blocked.
+            # that must reach the host normally, not be posted or blocked. paused is treated
+            # like active: a human reply while paused must post and resume the chat.
             return emit_pass(harness)
         stripped = prompt.lstrip()
         # Claude Code delivers background-task completions (the wake for a
@@ -964,18 +1070,20 @@ def hook_stop(harness, data, home):
 
     chat_id, name = session["chat_id"], session["name"]
     chat = get_chat(conn, chat_id)
-    if chat is None or chat["status"] != "active":
+    if chat is None or chat["status"] not in ("active", "paused"):
         return emit_pass(harness)
     if chat["turns_taken"] >= chat["max_turns"]:
         return emit_pass(harness)  # at limit: the host is waiting for the human
 
     script_path = os.path.abspath(sys.argv[0])
-    if chat["speaker"] == name:
+    # while paused there is no live turn to reply to, so the speaker check doesn't
+    # apply -- only the no-live-wait check below, so a paused chat can still wake claude.
+    if chat["status"] == "active" and chat["speaker"] == name:
         reason = (
-            "[multi-agent-chat] It is still your turn in chat %s. Post your reply now "
-            "(if you have nothing to add, post a one-line pass): "
-            "python3 %s post --chat %s --name %s --file - <<'EOF' ... EOF"
-            % (chat_id, script_path, chat_id, name)
+            "[multi-agent-chat] It is still your turn in chat %s. Post your reply now: "
+            "python3 %s post --chat %s --name %s --file - <<'EOF' ... EOF "
+            "or, if you have nothing new to add, pass: python3 %s pass --chat %s --name %s"
+            % (chat_id, script_path, chat_id, name, script_path, chat_id, name)
         )
         if harness == "claude":
             reason += (
@@ -1043,6 +1151,11 @@ def build_parser():
     po.add_argument("text", nargs="?", default=None)
     po.add_argument("--file", default=None)
     po.set_defaults(func=cmd_post)
+
+    pa = sub.add_parser("pass")
+    pa.add_argument("--chat", default=None)
+    pa.add_argument("--name", required=True)
+    pa.set_defaults(func=cmd_pass)
 
     e = sub.add_parser("end")
     e.add_argument("--chat", default=None)
