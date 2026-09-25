@@ -86,7 +86,7 @@ One SQLite file, `data/chat.db`, with one transaction per command. SQLite is cho
 | `wait --name codex [--timeout 300] [--skip-turn K]` | Blocks until it's this agent's turn (other than turn K, which a waker has already delivered), then prints the messages after its `read_seq` and sets `shown_seq` to the last one printed. Exit code: 0 = your turn, 3 = ended, 4 = timeout |
 | `post --name codex "<text>"` | Accepted only if the caller is the current speaker. Sets `read_seq = shown_seq` and passes the turn on |
 | `waker codex --thread T` | Codex only: the detached wake loop started by bind |
-| `extend --name N --turns K` | Any participant, while the chat is active: raises `max_turns` by K. The human asks with `// extend K` in any session; the host also uses it from the limit turn |
+| `extend --name N --turns K` | Any participant, while the chat is active: raises `max_turns` by K. The human asks any agent directly (`extend K`); the host also uses it from the limit turn |
 | `pass --name N` | The current speaker passes: no message, no turn used. A full round of passes pauses the chat |
 | `status` / `tail [--follow]` / `end` | Show state / show the chat for humans / end the chat |
 | `hook <harness> <event>` | Adapter entry point: hook JSON on stdin, the harness's expected response on stdout |
@@ -129,9 +129,9 @@ Names are `<harness>-<model>` in lowercase, with a short model word and no versi
 - **A turn with no post within 10 min is skipped,** with a system message, and counts as a pass. The check runs whenever any `chat.py` command runs, so no background process is needed.
 - **Reaching `max_turns` doesn't end the chat.** It gives the host a *limit turn*, which has no timeout, so the chat waits for the human.
   - If the discussion is finished, the host posts a closing summary, which ends the chat.
-  - Otherwise the host asks the human in its session whether to extend. The human answers privately (`// extend 6` or `// end the chat`), because a normal message would go to the chat. The host then runs `extend --turns 6` and continues its turn, or runs `end`.
+  - Otherwise the host asks the human in its session whether to extend. The human answers the host directly (`extend 6` or `end the chat`); normal prompts stay private to that agent. The host then runs `extend --turns 6` and continues its turn, or runs `end`.
   - Since the host always makes the final call, the conclusion is never split between a summary and a later correction.
-- **The chat also ends** when the human tells any agent privately `// end the chat` and it runs `end`. There's no `/end` keyword: Claude Code, Codex and opencode all treat `/…` as their own commands before any hook sees it.
+- **The chat also ends** when the human tells any agent `end the chat` and it runs `end`. There's no `/end` keyword: Claude Code, Codex and opencode all treat `/…` as their own commands before any hook sees it.
 
 ## Delivery
 
@@ -142,20 +142,20 @@ Names are `<harness>-<model>` in lowercase, with a short model word and no versi
 
 ## Human input
 
-`chat.py hook <harness> relay` decides what happens to each prompt the human types in a bound session:
+A normal prompt in a session is a direct, private chat with that agent. A prompt starting with `//` goes to the group. Most prompts are private conversation with the local agent, so that's the default and posting is the explicit act. `chat.py hook <harness> relay` decides each prompt in a bound session:
 
 | The human types | Result | Local harness |
 |---|---|---|
-| `what about latency?` | Posted as `human` | **Blocked**, so the agent doesn't answer out of turn; it gets the message on its next turn |
-| `@opencode your take?` | Posted; opencode speaks next | Blocked |
-| `// summarize so far for me` | Private, not posted | Passed through; only this agent answers |
-| `// end the chat` | Private; that agent runs `chat.py end` | Passed through |
-| `[multi-agent-chat] …` or any prompt in a session not in a chat | Ignored | Passed through |
-| Anything while the chat is in the lobby | Ignored: the human is setting up with the host ("everyone joined, start") | Passed through |
+| `push back harder on the cleanup rule` | Private: not posted | Passed through; the agent answers and applies it later without attributing it |
+| `end the chat` / `extend 10` | Private; the agent runs `end` / `extend` | Passed through |
+| `// what about latency?` | Posted as `human` with the `//` removed | **Blocked**, so the agent doesn't answer out of turn; it gets the message on its next turn |
+| `// @opencode-deepseek your take?` | Posted; that agent speaks next | Blocked |
+| `//` alone | Nothing posted | Blocked with "empty group message" |
+| Anything while the chat is in the lobby, or in a session not in a chat | Ignored | Passed through |
 
-- **If relaying fails** (for example `chat.py` errors or the database is locked), the prompt is blocked and the human sees the error. Passing it through would let the agent answer out of turn while the human thinks it went to the chat.
-- Claude Code and Codex can block a prompt with `UserPromptSubmit`.
-- opencode can't block a prompt, so the plugin rewrites it to `[multi-agent-chat] … Reply with exactly: posted` (S3).
+- **If relaying a `//` message fails** (for example `chat.py` errors or the database is locked), the prompt is blocked and the human sees the error, rather than the agent answering it as a private prompt.
+- Claude Code and Codex can block a prompt with `UserPromptSubmit`. opencode can't, so the plugin rewrites it to `[multi-agent-chat] … Reply with exactly: posted` (S3).
+- Injected wake prompts (`[multi-agent-chat] …`) and Claude's `<task-notification>` prompts don't start with `//`, so they pass through with no special case.
 
 ## Waking agents
 

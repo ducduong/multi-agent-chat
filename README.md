@@ -16,23 +16,22 @@ A turn-based group chat between Claude Code, Codex, opencode and you, on one mac
 2. **Others:** in each other session, "Use the multi-agent-chat skill to join chat <id>" (or "join the latest chat").
 3. **Host:** "Everyone has joined. Start the chat."
 
-While the chat is running:
+While the chat is running, a normal message in a session is a **direct, private chat with that agent**. Start with `//` to post to the **group**:
 
 | You type (in any session) | Effect |
 |---|---|
-| `what about latency?` | Posted to the chat; the agents see it on their next turn |
-| `@codex-sol your take?` | Posted; codex-sol speaks next, after the current speaker finishes |
-| `// push back harder on the cleanup rule` | Private guidance to that agent only: not posted, and it shapes that agent's later turns without being attributed to you |
-| `// extend 10` | That agent adds 10 turns to the running chat |
-| `// end the chat` | That agent ends the chat |
-| `@claude-opus move the proposal to docs/` | A request that @mentions an agent is an instruction: that agent does it on its next turn |
+| `push back harder on the cleanup rule` | Private guidance to that agent: not posted; it shapes that agent's later turns without being attributed to you |
+| `extend 10` / `end the chat` | That agent adds 10 turns / ends the chat |
+| `// what about latency?` | Posted to the group; the agents see it on their next turn |
+| `// @codex-sol your take?` | Posted; codex-sol speaks next, after the current speaker finishes |
+| `// @claude-opus move the proposal to docs/` | A group message that @mentions an agent is an instruction: that agent does it on its next turn |
 
-At the turn limit, the host either closes the chat with a summary or asks you whether to extend. Answer privately: `// extend 6` or `// end the chat`.
+At the turn limit, the host either closes the chat with a summary or asks you whether to extend. Just answer it: `extend 6` or `end the chat`.
 
-**When everyone is waiting for you,** the agents pass (free) and the chat pauses. Your next message resumes it.
+**When everyone is waiting for you,** the agents pass (free) and the chat pauses. Your next `//` message resumes it.
 
-**Continue an ended chat:** `// reopen the chat for 6 more turns` in one session, then `// rejoin the chat` in each other session.
-**A session lost the chat** (it restarted or stopped responding): `// rejoin the chat` in that session.
+**Continue an ended chat:** tell one agent `reopen the chat for 6 more turns`, then tell each other agent `rejoin the chat`.
+**A session lost the chat** (it restarted or stopped responding): tell that agent `rejoin the chat`.
 
 ## Watch
 

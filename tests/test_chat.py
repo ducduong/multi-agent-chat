@@ -466,7 +466,7 @@ class TestPauseResume(ChatTestCase):
         self.pause_three_way(chat_id)
 
         self.bind("claude", "s1", chat_id, "claude")
-        r = self.relay("claude", "s1", "let's continue")
+        r = self.relay("claude", "s1", "// let's continue")
         self.assertEqual(r.returncode, 0)
         data = json.loads(r.stdout)
         self.assertEqual(data["decision"], "block")
@@ -488,7 +488,7 @@ class TestPauseResume(ChatTestCase):
         self.pause_three_way(chat_id)
 
         self.bind("claude", "s1", chat_id, "claude")
-        self.relay("claude", "s1", "@codex please take over")
+        self.relay("claude", "s1", "// @codex please take over")
 
         st = self.run_cmd(["status", "--chat", chat_id], check=True)
         self.assertIn("status: active", st.stdout)
@@ -499,7 +499,7 @@ class TestPauseResume(ChatTestCase):
         self.pass_turn(chat_id, "claude")  # passes=1, speaker=codex
 
         self.bind("claude", "s1", chat_id, "claude")
-        self.relay("claude", "s1", "just a note")  # resets passes while still active
+        self.relay("claude", "s1", "// just a note")  # resets passes while still active
 
         row = self.query("SELECT passes FROM chats WHERE id=?", (chat_id,))[0]
         self.assertEqual(row[0], 0)
@@ -737,7 +737,7 @@ class TestDelivery(ChatTestCase):
         self.assertEqual(r.returncode, 0)
 
         # arrives after claude's shown_seq was frozen, before claude posts
-        r = self.relay("claude", session_id, "note while claude is speaking")
+        r = self.relay("claude", session_id, "// note while claude is speaking")
         self.assertEqual(r.returncode, 0)
         self.assertIn("posted", json.loads(r.stdout)["reason"])
 
@@ -756,7 +756,7 @@ class TestMentions(ChatTestCase):
         session_id = "sess-1"
         self.bind("claude", session_id, chat_id, "claude")
 
-        r = self.relay("claude", session_id, "@opencode what do you think?")
+        r = self.relay("claude", session_id, "// @opencode what do you think?")
         self.assertEqual(r.returncode, 0)
 
         st = self.run_cmd(["status", "--chat", chat_id], check=True)
@@ -776,7 +776,7 @@ class TestMentions(ChatTestCase):
         session_id = "sess-1"
         self.bind("claude", session_id, chat_id, "claude")
 
-        self.relay("claude", session_id, "@codex or actually @opencode go")
+        self.relay("claude", session_id, "// @codex or actually @opencode go")
 
         self.post(chat_id, "claude", "a")
         st = self.run_cmd(["status", "--chat", chat_id], check=True)
@@ -796,19 +796,14 @@ class TestRelayDecisions(ChatTestCase):
         self.assertEqual(r.stdout, "")
         self.assertFalse(os.path.exists(self.db_path()))
 
-    def test_bracket_prefixed_prompt_passes(self):
+    def test_normal_prompt_passes(self):
         chat_id = self.setup_three_way_chat()
         self.bind("claude", "s1", chat_id, "claude")
         r = self.relay("claude", "s1", "  [multi-agent-chat] injected content")
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout, "")
-
-    def test_slash_prefixed_prompt_passes(self):
-        chat_id = self.setup_three_way_chat()
-        self.bind("claude", "s1", chat_id, "claude")
-        r = self.relay("claude", "s1", "// summarize for me")
-        self.assertEqual(r.returncode, 0)
-        self.assertEqual(r.stdout, "")
+        rows = self.query("SELECT * FROM messages WHERE chat_id=? AND kind='human'", (chat_id,))
+        self.assertEqual(rows, [])
 
     def test_task_notification_passes(self):
         chat_id = self.setup_three_way_chat()
@@ -826,10 +821,19 @@ class TestRelayDecisions(ChatTestCase):
         rows = self.query("SELECT * FROM messages WHERE chat_id=?", (chat_id,))
         self.assertEqual(rows, [])
 
-    def test_public_prompt_blocks_and_posts(self):
+    def test_lobby_slash_prompt_passes_through(self):
+        chat_id = self.create_chat(name="claude", topic="t")
+        self.bind("claude", "s1", chat_id, "claude")
+        r = self.relay("claude", "s1", "// x")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+        rows = self.query("SELECT * FROM messages WHERE chat_id=?", (chat_id,))
+        self.assertEqual(rows, [])
+
+    def test_slash_prompt_blocks_and_posts_without_prefix(self):
         chat_id = self.setup_three_way_chat()
         self.bind("claude", "s1", chat_id, "claude")
-        r = self.relay("claude", "s1", "what about latency?")
+        r = self.relay("claude", "s1", "// what about latency?")
         self.assertEqual(r.returncode, 0)
         data = json.loads(r.stdout)
         self.assertEqual(data["decision"], "block")
@@ -839,10 +843,21 @@ class TestRelayDecisions(ChatTestCase):
         )
         self.assertEqual(rows, [("human", "human", "claude", "what about latency?")])
 
+    def test_empty_slash_prompt_blocks_without_posting(self):
+        chat_id = self.setup_three_way_chat()
+        self.bind("claude", "s1", chat_id, "claude")
+        r = self.relay("claude", "s1", "//")
+        self.assertEqual(r.returncode, 0)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["decision"], "block")
+        self.assertEqual(data["reason"], "empty group message — nothing posted")
+        rows = self.query("SELECT * FROM messages WHERE chat_id=? AND kind='human'", (chat_id,))
+        self.assertEqual(rows, [])
+
     def test_mention_prompt_blocks_and_sets_next_speaker(self):
         chat_id = self.setup_three_way_chat()
         self.bind("claude", "s1", chat_id, "claude")
-        r = self.relay("claude", "s1", "@codex your take?")
+        r = self.relay("claude", "s1", "// @codex your take?")
         data = json.loads(r.stdout)
         self.assertEqual(data["decision"], "block")
         rows = self.query("SELECT next_speaker FROM chats WHERE id=?", (chat_id,))
@@ -855,7 +870,7 @@ class TestRelayDecisions(ChatTestCase):
         conn.execute("DELETE FROM chats WHERE id=?", (chat_id,))
         conn.commit()
         conn.close()
-        r = self.relay("claude", "s1", "hello")
+        r = self.relay("claude", "s1", "// hello")
         self.assertEqual(r.returncode, 0)
         data = json.loads(r.stdout)
         self.assertEqual(data["decision"], "block")
@@ -869,12 +884,12 @@ class TestRelayDecisions(ChatTestCase):
         r = self.relay("opencode", "never-bound-oc", "hello")
         self.assertEqual(json.loads(r.stdout), {"action": "pass", "message": ""})
 
-        r = self.relay("opencode", "s1", "public message")
+        r = self.relay("opencode", "s1", "// public message")
         data = json.loads(r.stdout)
         self.assertEqual(data["action"], "block")
         self.assertIn("posted to chat", data["message"])
 
-        r = self.relay("opencode", "s1", "// private")
+        r = self.relay("opencode", "s1", "direct message")
         self.assertEqual(json.loads(r.stdout), {"action": "pass", "message": ""})
 
 
@@ -919,7 +934,7 @@ class TestConcurrency(ChatTestCase):
         total = n_per_worker * n_workers
 
         def post_one(i):
-            r = self.relay("claude", "concurrent-sess", "msg %d" % i)
+            r = self.relay("claude", "concurrent-sess", "// msg %d" % i)
             data = json.loads(r.stdout)
             m = re.search(r"as #(\d+)", data["reason"])
             return int(m.group(1))
@@ -959,7 +974,7 @@ class TestNameValidation(ChatTestCase):
         self.bind("claude", "s1", chat_id, "claude-fable", as_object=True)
         rows = self.query("SELECT name FROM sessions WHERE session_id='s1'")
         self.assertEqual(rows[0][0], "claude-fable")
-        self.relay("claude", "s1", "thoughts, @Codex-Sol?")
+        self.relay("claude", "s1", "// thoughts, @Codex-Sol?")
         rows = self.query("SELECT next_speaker FROM chats WHERE id=?", (chat_id,))
         self.assertEqual(rows[0][0], "codex-sol")
 
@@ -998,7 +1013,7 @@ class TestSkipTurn(ChatTestCase):
         )
         self.assertEqual(r.returncode, 4)
 
-        self.relay("claude", session_id, "hello during skip")
+        self.relay("claude", session_id, "// hello during skip")
 
         r = self.run_cmd(["wait", "--chat", chat_id, "--name", "claude", "--timeout", "2"])
         self.assertEqual(r.returncode, 0)
@@ -1226,7 +1241,7 @@ class TestRejoin(ChatTestCase):
         self.assertEqual(rows, [(chat_id, "codex")])
 
         self.post(chat_id, "claude", "a")  # codex's turn now
-        r = self.relay("codex", "sess-new", "note for codex")
+        r = self.relay("codex", "sess-new", "// note for codex")
         self.assertEqual(r.returncode, 0)
         self.assertIn("posted", json.loads(r.stdout)["reason"])
 
@@ -1344,26 +1359,29 @@ class TestWrappingQuotes(ChatTestCase):
     def test_wrapping_quotes_stripped_before_posting(self):
         chat_id = self.setup_three_way_chat()
         self.bind("claude", "s1", chat_id, "claude")
-        r = self.relay("claude", "s1", '"what about latency?"')
+        r = self.relay("claude", "s1", '"// what about latency?"')
         data = json.loads(r.stdout)
         self.assertEqual(data["decision"], "block")
         rows = self.query("SELECT text FROM messages WHERE chat_id=? AND kind='human'", (chat_id,))
         self.assertEqual(rows, [("what about latency?",)])
 
-    def test_wrapping_quotes_stripped_before_prefix_check(self):
+    def test_wrapping_quotes_stripped_before_slash_check(self):
         chat_id = self.setup_three_way_chat()
         self.bind("claude", "s1", chat_id, "claude")
-        r = self.relay("claude", "s1", '"[multi-agent-chat] injected"')
-        self.assertEqual(r.returncode, 0)
-        self.assertEqual(r.stdout, "")
+        r = self.relay("claude", "s1", '"// hidden message"')
+        data = json.loads(r.stdout)
+        self.assertEqual(data["decision"], "block")
+        rows = self.query("SELECT text FROM messages WHERE chat_id=? AND kind='human'", (chat_id,))
+        self.assertEqual(rows, [("hidden message",)])
 
     def test_single_quote_not_stripped(self):
         chat_id = self.setup_three_way_chat()
         self.bind("claude", "s1", chat_id, "claude")
-        r = self.relay("claude", "s1", '"unbalanced')
-        data = json.loads(r.stdout)
-        rows = self.query("SELECT text FROM messages WHERE chat_id=? AND kind='human'", (chat_id,))
-        self.assertEqual(rows, [('"unbalanced',)])
+        r = self.relay("claude", "s1", '"//unbalanced')
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+        rows = self.query("SELECT * FROM messages WHERE chat_id=? AND kind='human'", (chat_id,))
+        self.assertEqual(rows, [])
 
 
 class TestCodexWaker(ChatTestCase):

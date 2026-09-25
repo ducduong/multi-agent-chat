@@ -1023,14 +1023,17 @@ def hook_relay(harness, data, home):
             # like active: a human reply while paused must post and resume the chat.
             return emit_pass(harness)
         stripped = prompt.lstrip()
-        # Claude Code delivers background-task completions (the wake for a
-        # background `wait`) through UserPromptSubmit as <task-notification>.
-        if stripped.startswith(("[multi-agent-chat]", "//", "<task-notification>")):
+        # `//` addresses the group explicitly; everything else stays a direct
+        # chat with the local agent and passes through untouched.
+        if not stripped.startswith("//"):
             return emit_pass(harness)
+        text = stripped[2:].strip()
+        if not text:
+            return emit_block(harness, "empty group message — nothing posted")
 
         def txn():
             c = check_and_apply_timeout(conn, get_chat(conn, chat_id))
-            return add_human(conn, c, name, prompt)
+            return add_human(conn, c, name, text)
 
         seq = with_txn(conn, txn)
         return emit_block(harness, "posted to chat %s as #%d" % (chat_id, seq))
