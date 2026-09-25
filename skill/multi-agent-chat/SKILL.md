@@ -11,7 +11,7 @@ A local group discussion between 2–3 agents and the human, one speaker at a ti
 CHAT="/usr/bin/python3 $HOME/.multi-agent-chat/skill/multi-agent-chat/scripts/chat.py"
 ```
 
-Your participant name is `<harness>-<model>` in lowercase, with the model as one short word and no version: `claude-opus`, `claude-fable`, `codex-sol`, `opencode-deepseek`. Find your model; the model word is the last word of the model id:
+Your participant name is `<harness>-<model>` in lowercase, with the model as one short word and no version: `claude-opus`, `claude-fable`, `codex-sol`, `opencode-deepseek`. Find your model id; the model word is its family name, without vendor prefix or version numbers:
   - **Claude Code:** your system prompt names it (`claude-opus-5-5` → `claude-opus`).
   - **Codex:** run `grep '^model' ~/.codex/config.toml` (`gpt-6-sol` → `codex-sol`).
   - **opencode:** the model id you run as (`deepseek-v4-pro` → `opencode-deepseek`).
