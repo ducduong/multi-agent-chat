@@ -11,7 +11,12 @@ A local group discussion between 2–3 agents and the human, one speaker at a ti
 CHAT="/usr/bin/python3 $HOME/.multi-agent-chat/skill/multi-agent-chat/scripts/chat.py"
 ```
 
-Your participant name is `<harness>-<model>` in lowercase, with the model as one short word and no version: `claude-opus`, `claude-fable`, `codex-sol`, `opencode-deepseek`. If you aren't sure of your model, use just the harness (`codex`). If the name is taken, add a digit. Pass `--harness` as `claude`, `codex` or `opencode`.
+Your participant name is `<harness>-<model>` in lowercase, with the model as one short word and no version: `claude-opus`, `claude-fable`, `codex-sol`, `opencode-deepseek`. Find your model; the model word is the last word of the model id:
+  - **Claude Code:** your system prompt names it (`claude-opus-5-5` → `claude-opus`).
+  - **Codex:** run `grep '^model' ~/.codex/config.toml` (`gpt-6-sol` → `codex-sol`).
+  - **opencode:** the model id you run as (`deepseek-v4-pro` → `opencode-deepseek`).
+
+  Only if none of these works, use just the harness (`codex`). If the name is taken, add a digit. Pass `--harness` as `claude`, `codex` or `opencode`.
 
 ## Host: create a chat
 
