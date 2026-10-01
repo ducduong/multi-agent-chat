@@ -44,7 +44,7 @@ Everything installed lives in one folder. The repo holds the source, and `instal
 
 ```
 ~/.multi-agent-chat/
-  config.json                 # defaults: max_turns 12, turn_timeout_s 600, wait_timeout_s 300
+  config.json                 # defaults: max_turns 12, turn_timeout_s 600, wait_timeout_s 300 (wait's default when --timeout is omitted)
   skill/multi-agent-chat/     # the original skill: SKILL.md + scripts/chat.py
   adapters/                   # claude + codex hook snippets, opencode plugin source
   data/chat.db
@@ -161,9 +161,12 @@ A normal prompt in a session is a direct, private chat with that agent. A prompt
 
 Every harness runs the same loop: **`wait` returns → messages go to the agent → the agent posts → wait again.** A wake counts only when the post goes through.
 
-- **Claude Code:** the agent runs `chat.py wait` with `run_in_background` after each post. Claude Code re-invokes it when the command exits, as the background task results did in the design session. The session stays idle and free for the human to type into. Hooks: `UserPromptSubmit` → relay; `PostToolUse` (Bash) → bind.
+- **Claude Code:** the agent posts with `post --and-wait` as one background command, which posts and then waits for its next turn (`wait --timeout 0` after joining). Claude Code re-invokes the agent when the command exits. A turn costs 2 model calls, and an idle or paused chat costs none. The session stays idle and free for the human to type into.
+  - Hooks: `UserPromptSubmit` → relay; `PostToolUse` (Bash) → bind; `Stop` → safety net.
+  - The Stop hook blocks an agent from ending its response while it still holds the turn, or (Claude) while no wait is running. `wait` records its pid, and a 5 s grace covers a wait that was just launched. The hook passes on the host's limit turn and on a second consecutive stop, to avoid loops.
+  - Claude Code loads hooks when a session starts, so a session that predates an install doesn't have new hooks.
 - **opencode:** the plugin (`~/.config/opencode/plugins/multi-agent-chat.js`) uses `tool.execute.after` → bind and `chat.message` → relay. A blocked prompt is rewritten rather than blocked (see S3). Its wake loop runs `chat.py wait --skip-turn <last>` → `client.session.promptAsync(...)`, so each turn is delivered once.
-- **Codex:** hooks in `~/.codex/hooks.json`: `UserPromptSubmit` → relay; `PostToolUse` → bind, which starts a detached waker (`chat.py waker codex`, one per participant) that loops `wait --skip-turn <last>` → `codex queue --thread <session_id> --message "[multi-agent-chat] …"`.
+- **Codex:** hooks in `~/.codex/hooks.json`: `UserPromptSubmit` → relay; `Stop` → safety net (turn check only); `PostToolUse` → bind, which starts a detached waker (`chat.py waker codex`, one per participant) that loops `wait --skip-turn <last>` → `codex queue --thread <session_id> --message "[multi-agent-chat] …"`.
 
 Reported bugs mean injection alone doesn't prove a wake. There are reports of `codex queue` not running messages for unloaded threads, and of `promptAsync` saving messages without starting a turn on busy sessions. The spikes test the full cycle through to a post.
 
