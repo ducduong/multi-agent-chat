@@ -18,7 +18,7 @@ MENTION_RE = re.compile(r"(?<![\w@])@([a-z0-9](?:[a-z0-9_-]*[a-z0-9])?)", re.IGN
 BIND_RE = re.compile(r"MAC_BIND chat=([0-9]{8}-[0-9a-f]{4}) name=([a-z0-9][a-z0-9_-]*)")
 # <harness>-<model>, e.g. claude-opus; hyphens allowed inside, never at the ends.
 NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,30}[a-z0-9])?$")
-TURN_HEADER_RE = re.compile(r"your turn \((\d+)/\d+\)")
+GRANT_HEADER_RE = re.compile(r"grant (\d+)")
 CODEX_WAKER_TIMEOUT_S = 300
 CODEX_QUEUE_RETRY_S = 5
 
@@ -63,6 +63,15 @@ def init_schema(conn):
         # participant count pauses the chat (see pass_and_advance). Added via ALTER
         # rather than the CREATE TABLE above because existing DBs predate this column.
         conn.execute("ALTER TABLE chats ADD COLUMN passes INTEGER DEFAULT 0")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
+    try:
+        # grant_id: bumped by grant_turn on every turn delivery, including ones that
+        # don't move turns_taken (a pass, a skip, a pause/resume) -- the waker/wait
+        # dedupe key, since turns_taken alone isn't unique enough to tell two
+        # consecutive turns apart. Added via ALTER for the same reason as `passes`.
+        conn.execute("ALTER TABLE chats ADD COLUMN grant_id INTEGER DEFAULT 0")
     except sqlite3.OperationalError as e:
         if "duplicate column" not in str(e).lower():
             raise
@@ -176,12 +185,21 @@ def pick_next_speaker(conn, chat_id, current_speaker, next_speaker_override):
     return names[(idx + 1) % len(names)]
 
 
+def grant_turn(conn, chat_id, speaker):
+    """Sets the new speaker, resets the turn clock, and bumps grant_id. grant_id is
+    the waker/wait dedupe key: turns_taken doesn't move on a pass, a skip, or a
+    pause/resume, so it can't tell two consecutively-delivered turns apart, but
+    grant_id changes on every one of them."""
+    conn.execute(
+        "UPDATE chats SET speaker=?, next_speaker=NULL, turn_started_at=?, "
+        "grant_id=grant_id+1 WHERE id=?",
+        (speaker, time.time(), chat_id),
+    )
+
+
 def advance_turn(conn, chat_id, current_speaker, next_speaker_override):
     new_speaker = pick_next_speaker(conn, chat_id, current_speaker, next_speaker_override)
-    conn.execute(
-        "UPDATE chats SET speaker=?, next_speaker=NULL, turn_started_at=? WHERE id=?",
-        (new_speaker, time.time(), chat_id),
-    )
+    grant_turn(conn, chat_id, new_speaker)
     return new_speaker
 
 
@@ -192,10 +210,7 @@ def bump_turns_taken(conn, chat_id, chat):
     turns_taken = chat["turns_taken"] + 1
     conn.execute("UPDATE chats SET turns_taken=? WHERE id=?", (turns_taken, chat_id))
     if turns_taken >= chat["max_turns"]:
-        conn.execute(
-            "UPDATE chats SET speaker=?, next_speaker=NULL, turn_started_at=? WHERE id=?",
-            (chat["host"], time.time(), chat_id),
-        )
+        grant_turn(conn, chat_id, chat["host"])
         add_system_message(
             conn, chat_id,
             "turn limit reached (%d turns) · host decides: close or ask the human to extend"
@@ -269,11 +284,8 @@ def add_human(conn, chat, via, text):
         # speaker already holds the next-in-line agent (set when the chat paused);
         # a mention overrides it, otherwise that agent resumes.
         speaker = last_mention or chat["speaker"]
-        conn.execute(
-            "UPDATE chats SET status='active', speaker=?, next_speaker=NULL, turn_started_at=? "
-            "WHERE id=?",
-            (speaker, time.time(), chat["id"]),
-        )
+        conn.execute("UPDATE chats SET status='active' WHERE id=?", (chat["id"],))
+        grant_turn(conn, chat["id"], speaker)
         add_system_message(conn, chat["id"], "resumed by the human")
     elif last_mention:
         conn.execute("UPDATE chats SET next_speaker=? WHERE id=?", (last_mention, chat["id"]))
@@ -420,11 +432,8 @@ def cmd_start(args, home, conn):
         if chat["status"] != "lobby":
             fail("chat already started")
         names = [r["name"] for r in roster(conn, chat_id)]
-        conn.execute(
-            "UPDATE chats SET status='active', speaker=?, turn_started_at=?, next_speaker=NULL "
-            "WHERE id=?",
-            (chat["host"], time.time(), chat_id),
-        )
+        conn.execute("UPDATE chats SET status='active' WHERE id=?", (chat_id,))
+        grant_turn(conn, chat_id, chat["host"])
         add_system_message(conn, chat_id, "chat started · order: %s" % " → ".join(names))
 
     with_txn(conn, txn)
@@ -435,12 +444,14 @@ def cmd_start(args, home, conn):
 def format_turn_text(chat_id, name, chat, messages, next_after):
     at_limit = chat["turns_taken"] >= chat["max_turns"]
     if at_limit:
-        header = "[multi-agent-chat] chat %s · your turn (%d/%d) · turn limit reached — you are the host" % (
-            chat_id, chat["turns_taken"] + 1, chat["max_turns"],
+        header = (
+            "[multi-agent-chat] chat %s · your turn (%d/%d) · grant %d · "
+            "turn limit reached — you are the host"
+            % (chat_id, chat["turns_taken"] + 1, chat["max_turns"], chat["grant_id"])
         )
     else:
-        header = "[multi-agent-chat] chat %s · your turn (%d/%d) · next: %s" % (
-            chat_id, chat["turns_taken"] + 1, chat["max_turns"], next_after,
+        header = "[multi-agent-chat] chat %s · your turn (%d/%d) · grant %d · next: %s" % (
+            chat_id, chat["turns_taken"] + 1, chat["max_turns"], chat["grant_id"], next_after,
         )
     lines = [header]
     lines.extend(format_message(row) for row in messages)
@@ -463,13 +474,15 @@ def format_turn_text(chat_id, name, chat, messages, next_after):
     return "\n".join(lines)
 
 
-def wait_for_turn(conn, chat_id, name, timeout, skip_turn):
+def wait_for_turn(conn, chat_id, name, timeout, skip_grant):
     """Block until it's `name`'s turn, the chat ends, or `timeout` elapses.
     timeout == 0 means no timeout (block indefinitely).
 
-    `skip_turn`, when set, is a turn number (turns_taken+1) already delivered:
-    that turn is not returned again, so a caller re-polling after delivering it
-    doesn't re-deliver the same turn while waiting for the post that ends it.
+    `skip_grant`, when set, is a grant_id already delivered: that turn is not
+    returned again, so a caller re-polling after delivering it doesn't re-deliver
+    the same turn while waiting for the post that ends it. grant_id (not
+    turns_taken) is the right key here because a pass, a skip, or a pause/resume
+    can grant a new turn without moving turns_taken.
     Returns (exit_code, text): 0 (turn, text is the turn block), 3 (ended) or
     4 (timed out; text is a one-line status message).
     """
@@ -483,8 +496,7 @@ def wait_for_turn(conn, chat_id, name, timeout, skip_turn):
         if chat["status"] == "ended":
             return ("ended", None)
         if chat["status"] == "active" and chat["speaker"] == name:
-            turn_number = chat["turns_taken"] + 1
-            if skip_turn is not None and turn_number == skip_turn:
+            if skip_grant is not None and chat["grant_id"] == skip_grant:
                 return (None, None)
             participant = get_participant(conn, chat_id, name)
             messages = conn.execute(
@@ -553,7 +565,7 @@ def cmd_wait(args, home, conn):
     # codex waker, which is a distinct long-lived process the stop hook doesn't track).
     with_txn(conn, lambda: set_wait_pid(conn, chat_id, args.name, os.getpid()))
     try:
-        code, text = wait_for_turn(conn, chat_id, args.name, timeout, args.skip_turn)
+        code, text = wait_for_turn(conn, chat_id, args.name, timeout, args.skip_grant)
     finally:
         with_txn(conn, lambda: set_wait_pid(conn, chat_id, args.name, None))
     print(text)
@@ -692,10 +704,9 @@ def cmd_reopen(args, home, conn):
             fail("chat is not ended")
         new_max = chat["turns_taken"] + turns_add
         conn.execute(
-            "UPDATE chats SET status='active', max_turns=?, speaker=?, next_speaker=NULL, "
-            "turn_started_at=? WHERE id=?",
-            (new_max, args.name, time.time(), chat_id),
+            "UPDATE chats SET status='active', max_turns=? WHERE id=?", (new_max, chat_id)
         )
+        grant_turn(conn, chat_id, args.name)
         add_system_message(
             conn, chat_id, "chat reopened by %s (+%d turns)" % (args.name, turns_add)
         )
@@ -703,6 +714,29 @@ def cmd_reopen(args, home, conn):
     with_txn(conn, txn)
     print("chat %s reopened" % chat_id)
     print("MAC_BIND chat=%s name=%s" % (chat_id, args.name))
+    return 0
+
+
+def cmd_resume(args, home, conn):
+    chat_id = resolve_chat_id(conn, args.chat)
+
+    def txn():
+        chat = get_chat(conn, chat_id)
+        if chat is None:
+            fail("chat %s not found" % chat_id)
+        if chat["host"] != args.name:
+            fail("only the host can resume the chat")
+        if chat["status"] != "paused":
+            fail("chat is not paused")
+        conn.execute("UPDATE chats SET status='active', passes=0 WHERE id=?", (chat_id,))
+        grant_turn(conn, chat_id, args.name)
+        add_system_message(conn, chat_id, "resumed by %s" % args.name)
+
+    with_txn(conn, txn)
+    # A codex waker can die while paused (crash, machine restart); respawn any that
+    # did, or that agent is never woken for its rotation turn again.
+    respawn_codex_wakers(conn, home, chat_id)
+    print("chat %s resumed · your turn comes through your wait" % chat_id)
     return 0
 
 
@@ -725,8 +759,9 @@ def cmd_extend(args, home, conn):
         conn.execute("UPDATE chats SET max_turns=? WHERE id=?", (new_max, chat_id))
         if at_limit:
             # the host's turn only just started for real (it was parked waiting on a
-            # human decision); give it a fresh timeout clock instead of the stale one.
-            conn.execute("UPDATE chats SET turn_started_at=? WHERE id=?", (time.time(), chat_id))
+            # human decision); give it a fresh timeout clock and a new grant instead
+            # of the stale ones (speaker is already the host from bump_turns_taken).
+            grant_turn(conn, chat_id, chat["host"])
         add_system_message(
             conn, chat_id,
             "%s extended the chat by %d turns (now %d)" % (args.name, args.turns, new_max),
@@ -895,6 +930,19 @@ def spawn_codex_waker(home, chat_id, name, thread):
         )
 
 
+def respawn_codex_wakers(conn, home, chat_id):
+    """Resume needs every already-bound codex participant reachable again, in case
+    its waker died while the chat was paused. spawn_codex_waker (hook_bind's own
+    path) is a no-op when a waker for that chat/name is already alive, so this just
+    re-walks the bindings instead of duplicating the liveness check."""
+    rows = conn.execute(
+        "SELECT name, session_id, MAX(rowid) FROM sessions WHERE harness='codex' AND chat_id=? "
+        "GROUP BY name", (chat_id,)
+    ).fetchall()
+    for row in rows:
+        spawn_codex_waker(home, chat_id, row["name"], row["session_id"])
+
+
 def cmd_waker(args, home, conn):
     if args.harness != "codex":
         fail("unknown waker harness: %s" % args.harness)
@@ -915,12 +963,12 @@ def cmd_waker(args, home, conn):
                 return 0
             if code == 4:
                 continue
-            m = TURN_HEADER_RE.search(text)
-            turn_number = int(m.group(1)) if m else None
+            m = GRANT_HEADER_RE.search(text)
+            grant_number = int(m.group(1)) if m else None
             try:
                 subprocess.run([codex_bin, "queue", "--thread", args.thread, "--message", text],
                                 check=True)
-                last_delivered = turn_number
+                last_delivered = grant_number
             except (OSError, subprocess.CalledProcessError) as e:
                 with open(log_path, "a", encoding="utf-8") as logf:
                     logf.write("%s codex queue failed: %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), e))
@@ -1191,7 +1239,10 @@ def build_parser():
     w.add_argument("--chat", default=None)
     w.add_argument("--name", required=True)
     w.add_argument("--timeout", type=float, default=None)
-    w.add_argument("--skip-turn", type=int, dest="skip_turn", default=None)
+    w.add_argument("--skip-grant", type=int, dest="skip_grant", default=None)
+    # legacy alias: old wakers/plugins pass a turn number here instead of a grant
+    # id -- harmless, worst case it re-delivers one already-seen turn once.
+    w.add_argument("--skip-turn", type=int, dest="skip_grant", help=argparse.SUPPRESS)
     w.set_defaults(func=cmd_wait)
 
     po = sub.add_parser("post")
@@ -1220,6 +1271,11 @@ def build_parser():
     ro.add_argument("--name", required=True)
     ro.add_argument("--turns", type=int, default=None)
     ro.set_defaults(func=cmd_reopen)
+
+    rs = sub.add_parser("resume")
+    rs.add_argument("--chat", default=None)
+    rs.add_argument("--name", required=True)
+    rs.set_defaults(func=cmd_resume)
 
     ex = sub.add_parser("extend")
     ex.add_argument("--chat", default=None)

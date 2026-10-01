@@ -135,6 +135,9 @@ class ChatTestCase(unittest.TestCase):
             args += ["--turns", str(turns)]
         return self.run_cmd(args, check=check)
 
+    def resume(self, chat_id, name, check=True):
+        return self.run_cmd(["resume", "--chat", chat_id, "--name", name], check=check)
+
     def setup_three_way_chat(self, max_turns=12):
         chat_id = self.create_chat(name="claude", topic="t", max_turns=max_turns)
         self.join(chat_id, "codex")
@@ -1350,6 +1353,181 @@ class TestReopenCodexWaker(ChatTestCase):
         self.reopen(chat_id, "codex", check=True)
         self.bind("codex", "codex-sess-reopen", chat_id, "codex")
         self.wait_until(lambda: os.path.exists(pidfile), 5, "waker did not spawn after reopen")
+
+        self.run_cmd(["end", "--chat", chat_id, "--name", "codex"], check=True)
+        self.wait_until(lambda: not os.path.exists(pidfile), 8, "waker did not exit after chat ended")
+
+
+class TestResume(ChatTestCase):
+    def pause_two_way(self, chat_id):
+        self.pass_turn(chat_id, "claude")
+        self.pass_turn(chat_id, "codex")  # paused, speaker=claude (next-in-line)
+
+    def test_non_host_resume_rejected(self):
+        chat_id = self.setup_two_way_chat()
+        self.pause_two_way(chat_id)
+        r = self.resume(chat_id, "codex", check=False)
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_resume_on_active_chat_rejected(self):
+        chat_id = self.setup_two_way_chat()
+        r = self.resume(chat_id, "claude", check=False)
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_resume_on_ended_chat_rejected(self):
+        chat_id = self.setup_two_way_chat()
+        self.run_cmd(["end", "--chat", chat_id, "--name", "claude"], check=True)
+        r = self.resume(chat_id, "claude", check=False)
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_host_resume_reactivates_chat_and_rotation_continues(self):
+        chat_id = self.setup_two_way_chat()
+        self.pause_two_way(chat_id)
+
+        r = self.resume(chat_id, "claude", check=True)
+        self.assertIn("resumed", r.stdout)
+
+        st = self.run_cmd(["status", "--chat", chat_id], check=True)
+        self.assertIn("status: active", st.stdout)
+        self.assertIn("speaker: claude", st.stdout)
+        row = self.query("SELECT passes FROM chats WHERE id=?", (chat_id,))[0]
+        self.assertEqual(row[0], 0)
+        tail = self.run_cmd(["tail", "--chat", chat_id], check=True)
+        self.assertIn("resumed by claude", tail.stdout)
+
+        w = self.wait(chat_id, "claude", timeout=2)
+        self.assertEqual(w.returncode, 0)
+        self.assertIn("your turn", w.stdout)
+
+        self.post(chat_id, "claude", "continuing")
+        r2 = self.wait(chat_id, "codex", timeout=2)
+        self.assertEqual(r2.returncode, 0)
+        self.assertIn("your turn", r2.stdout)
+
+
+class TestResumeCodexWaker(ChatTestCase):
+    def setUp(self):
+        super().setUp()
+        self.codex_log = os.path.join(self.home, "fake-codex.log")
+        self.codex_bin = os.path.join(self.home, "fake-codex.sh")
+        with open(self.codex_bin, "w") as f:
+            f.write('#!/bin/sh\necho "$@" >> "%s"\nexit 0\n' % self.codex_log)
+        os.chmod(self.codex_bin, 0o755)
+        self.env["MAC_CODEX_BIN"] = self.codex_bin
+
+    def wait_until(self, predicate, timeout, message):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return
+            time.sleep(0.1)
+        self.fail(message)
+
+    def test_resume_respawns_a_dead_codex_waker(self):
+        chat_id = self.setup_two_way_chat()  # host=claude, codex is the other participant
+        self.bind_direct("codex", "codex-sess-1", chat_id, "codex")  # bound, waker never started
+
+        pidfile = os.path.join(self.home, "data", "wakers", "%s-codex.pid" % chat_id)
+        self.assertFalse(os.path.exists(pidfile))
+
+        self.pass_turn(chat_id, "claude")
+        self.pass_turn(chat_id, "codex")  # paused, speaker=claude
+
+        self.resume(chat_id, "claude", check=True)
+        self.wait_until(lambda: os.path.exists(pidfile), 5, "waker did not spawn on resume")
+
+        self.post(chat_id, "claude", "continuing")  # codex's turn now
+
+        def queued():
+            if not os.path.exists(self.codex_log):
+                return False
+            with open(self.codex_log) as f:
+                content = f.read()
+            return "codex-sess-1" in content and "your turn" in content
+
+        self.wait_until(queued, 5, "waker never queued codex's turn")
+
+        self.run_cmd(["end", "--chat", chat_id, "--name", "claude"], check=True)
+        self.wait_until(lambda: not os.path.exists(pidfile), 8, "waker did not exit after chat ended")
+
+
+class TestGrant(ChatTestCase):
+    def test_header_includes_grant_and_increments_each_delivery(self):
+        chat_id = self.setup_two_way_chat(max_turns=12)
+        r1 = self.wait(chat_id, "claude", timeout=2)
+        self.assertRegex(r1.stdout, r"your turn \(1/12\) · grant \d+")
+        grant1 = int(re.search(r"grant (\d+)", r1.stdout).group(1))
+
+        self.post(chat_id, "claude", "a")
+        r2 = self.wait(chat_id, "codex", timeout=2)
+        grant2 = int(re.search(r"grant (\d+)", r2.stdout).group(1))
+        self.assertGreater(grant2, grant1)
+
+    def test_skip_turn_alias_still_compares_against_grant(self):
+        chat_id = self.setup_two_way_chat(max_turns=12)
+        r1 = self.wait(chat_id, "claude", timeout=2)
+        grant = int(re.search(r"grant (\d+)", r1.stdout).group(1))
+
+        # old flag name, old-style value (a turn number would equal the same grant
+        # here since nothing has passed/skipped yet) -- still understood as a grant.
+        r2 = self.run_cmd(
+            ["wait", "--chat", chat_id, "--name", "claude", "--timeout", "1",
+             "--skip-turn", str(grant)]
+        )
+        self.assertEqual(r2.returncode, 4)  # same grant already delivered -> skipped, times out
+
+
+class TestGrantSurvivesPassesWithoutAPost(ChatTestCase):
+    """Regression for the bug this fixes: turns_taken (and the old turn-number
+    dedupe key derived from it) doesn't move on a pass, so two different turns
+    delivered to the same agent could carry the same key and the second would be
+    silently skipped forever. grant_id changes on every delivery instead."""
+
+    def setUp(self):
+        super().setUp()
+        self.codex_log = os.path.join(self.home, "fake-codex.log")
+        self.codex_bin = os.path.join(self.home, "fake-codex.sh")
+        with open(self.codex_bin, "w") as f:
+            f.write('#!/bin/sh\necho "$@" >> "%s"\nexit 0\n' % self.codex_log)
+        os.chmod(self.codex_bin, 0o755)
+        self.env["MAC_CODEX_BIN"] = self.codex_bin
+
+    def wait_until(self, predicate, timeout, message):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return
+            time.sleep(0.1)
+        self.fail(message)
+
+    def codex_log_content(self):
+        if not os.path.exists(self.codex_log):
+            return ""
+        with open(self.codex_log) as f:
+            return f.read()
+
+    def grants_delivered(self):
+        return re.findall(r"grant (\d+)", self.codex_log_content())
+
+    def test_pass_pass_post_delivers_codexs_next_turn_with_a_new_grant(self):
+        chat_id = self.create_chat(name="codex", topic="t", max_turns=12)
+        self.join(chat_id, "claude")
+        self.join(chat_id, "opencode")
+        self.start(chat_id, "codex")
+        self.bind("codex", "codex-sess-1", chat_id, "codex")
+
+        pidfile = os.path.join(self.home, "data", "wakers", "%s-codex.pid" % chat_id)
+        self.wait_until(lambda: os.path.exists(pidfile), 5, "waker did not spawn")
+        self.wait_until(lambda: len(self.grants_delivered()) >= 1, 5, "first turn never queued")
+
+        self.pass_turn(chat_id, "codex")  # speaker=claude
+        self.pass_turn(chat_id, "claude")  # speaker=opencode; turns_taken still 0 throughout
+        self.post(chat_id, "opencode", "back to you codex")  # real post; rotation reaches codex
+
+        self.wait_until(lambda: len(self.grants_delivered()) >= 2, 5, "codex's next turn never queued")
+        grants = self.grants_delivered()
+        self.assertEqual(len(grants), 2)
+        self.assertNotEqual(grants[0], grants[1])
 
         self.run_cmd(["end", "--chat", chat_id, "--name", "codex"], check=True)
         self.wait_until(lambda: not os.path.exists(pidfile), 8, "waker did not exit after chat ended")

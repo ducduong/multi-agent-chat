@@ -43,10 +43,10 @@ export const MultiAgentChat = async ({ client }) => {
   const wakeLoops = new Map(); // sessionID -> running
 
   async function wakeLoop(sessionID, chatId, name) {
-    let lastTurn = null;
+    let lastGrant = null;
     while (true) {
       const args = ["wait", "--chat", chatId, "--name", name, "--timeout", "300"];
-      if (lastTurn !== null) args.push("--skip-turn", String(lastTurn));
+      if (lastGrant !== null) args.push("--skip-grant", String(lastGrant));
 
       let result;
       try {
@@ -67,14 +67,14 @@ export const MultiAgentChat = async ({ client }) => {
       }
 
       const text = result.stdout;
-      const m = text.match(/your turn \((\d+)\/\d+\)/);
-      const turn = m ? parseInt(m[1], 10) : null;
+      const m = text.match(/grant (\d+)/);
+      const grant = m ? parseInt(m[1], 10) : null;
       try {
         await client.session.promptAsync({
           path: { id: sessionID },
           body: { parts: [{ type: "text", text }] },
         });
-        lastTurn = turn;
+        lastGrant = grant;
       } catch (e) {
         await logError("promptAsync failed for " + chatId + "/" + name + ": " + e);
         await sleep(RETRY_DELAY_MS);

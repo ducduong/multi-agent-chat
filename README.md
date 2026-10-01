@@ -45,6 +45,7 @@ A normal message in a session is a **private, direct chat with that agent**. Sta
 | `what's your honest read so far?` | Private question; only that agent answers |
 | `extend 10` | That agent adds 10 turns |
 | `end the chat` | That agent ends the chat |
+| `continue the discussion` (to the host) | Host resumes a paused chat |
 | `// what about latency?` | Posted to the group; each agent sees it on its next turn |
 | `// @codex-sol your take?` | Posted; codex-sol speaks next, after the current speaker finishes |
 | `// @claude-opus move the proposal to docs/` | A group message that @mentions an agent is an instruction: that agent does it on its next turn |
@@ -57,7 +58,7 @@ Tips:
 
 - **Rotation:** agents speak one at a time in join order. Your messages never use a turn.
 - **Pass:** an agent with nothing new to add passes. A pass is free: nothing is posted and no turn is used.
-- **Pause:** when every agent passes in a row (for example, all waiting for you), the chat pauses. There are no turns and no model calls until your next `//` message, which resumes it.
+- **Pause:** when every agent passes in a row (for example, all waiting for you), the chat pauses. There are no turns and no model calls until it's resumed, either by a `//` message from you or by telling the host directly, for example `continue the discussion`, `I decided X, carry on`.
 - **Timeout:** an agent that doesn't respond within 10 minutes is skipped. A skip counts as a pass, so an absent agent leads to a pause, not a loop.
 - **Turn limit:** the chat doesn't end automatically. At the limit, the host either posts a closing summary, which ends the chat, or asks whether to extend. Just answer it: `extend 6` or `end the chat`.
 
@@ -73,7 +74,7 @@ mac status             # status, participants, current speaker, turns used / lim
 
 | Symptom | Fix |
 |---|---|
-| An agent stopped responding, or never takes its turn | Tell it: `rejoin the chat` (or `resume the chat`). It retakes its seat and gets everything it missed |
+| An agent stopped responding, or never takes its turn | Tell it: `rejoin the chat`. It retakes its seat and gets everything it missed |
 | A session was restarted mid-chat | Same: `rejoin the chat` |
 | The chat ended but you want more | Tell one agent `reopen the chat for 6 more turns`, then tell each other agent `rejoin the chat` |
 | A new hook doesn't seem to run | Restart the session. In Codex, also trust the hook in `/hooks` |
@@ -101,6 +102,7 @@ Agents run these through the skill. You only need `tail` and `status`, but every
 | `pass --chat C --name N [--and-wait]` | Pass on your turn (free) |
 | `extend --chat C --name N --turns K` | Add K turns (any participant; active or paused) |
 | `reopen --chat C --name N [--turns K]` | Continue an ended chat; N speaks first |
+| `resume --chat C --name N` | Host resumes a paused chat; the host speaks first, and others are woken by rotation |
 | `end --chat C [--name N]` | End the chat |
 | `status [--chat C]` / `tail [--chat C] [--follow]` | Inspect or watch |
 

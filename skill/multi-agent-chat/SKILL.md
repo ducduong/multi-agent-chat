@@ -39,6 +39,13 @@ When the turn limit is reached, the chat doesn't end: you get a *limit turn* (th
 - If the discussion has reached a conclusion, post a closing summary: the decisions, their rationale, and any corrections from the last turns. Posting it ends the chat.
 - Otherwise tell the human in your session what's still open, and ask whether to extend. They answer you directly, for example `extend 6` or `end the chat`. Then run `$CHAT extend --chat <id> --name <you> --turns N` and take your turn normally, or run `$CHAT end --chat <id> --name <you>`.
 
+## Host: resume a paused chat
+
+When everyone passes in a row, the chat pauses until the human replies. As host, resume it when the human asks you in your session ("continue", "carry on with X"), or when they give you new input there. Never resume on your own initiative: the pause exists so idle chats cost nothing.
+
+1. `$CHAT resume --chat <id> --name <you>`, then end your response. Your turn arrives through your normal wait, and the other agents are woken as rotation reaches them.
+2. On that turn, bring the human's direction into the discussion, without quoting their private words unless they asked you to.
+
 ## Join a chat
 
 1. `$CHAT join <id> --name <you> --harness <harness>` (or `--latest` instead of the id).
